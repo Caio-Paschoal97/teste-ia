@@ -13,7 +13,28 @@ concurrency:
 
 jobs:
   server:
-    name: Server typecheck + build
+    name: Server + MySQL integration
+    env:
+      DATABASE_URL: mysql://root:ci@127.0.0.1:3306/pokeidle_ci
+    services:
+      postgres-source:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: source_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U postgres" --health-interval=5s --health-timeout=5s --health-retries=30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: pokeidle_ci
+          MYSQL_ROOT_PASSWORD: ci
+          MYSQL_ROOT_HOST: "%"
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -pci"
+          --health-interval=5s --health-timeout=5s --health-retries=30
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -26,12 +47,40 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
       - run: npm ci
-      # Prisma generate needs DATABASE_URL but only inspects the schema —
-      # not the live DB — so a fake URL is fine for codegen.
-      - run: npx prisma generate
+      - run: npm run db:generate
+      - run: npm run db:deploy
+      - run: npm run db:status
+      - run: npx prisma migrate diff --from-schema-datasource prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --exit-code
+      - name: Rehearse copy from PostgreSQL history
         env:
-          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
-      - run: npm run build
+          SOURCE_DATABASE_URL: postgresql://postgres:ci@127.0.0.1:5432/source_ci
+        run: |
+          for migration in prisma/postgresql-history/*/migration.sql; do
+            psql "$SOURCE_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"
+          done
+          psql "$SOURCE_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+            INSERT INTO "User" (id,email,username,"updatedAt","saveData")
+            VALUES ('copy-id','copy@example.test','cópia',CURRENT_TIMESTAMP,json_build_object('note',repeat('🐉',40000))::text);
+            INSERT INTO "DailyActive" (id,"userId",day) VALUES ('copied-day','copy-id','2024-02-29');
+          SQL
+          python3 -m venv "$RUNNER_TEMP/copy-env"
+          "$RUNNER_TEMP/copy-env/bin/pip" install -r scripts/copy-requirements.txt
+          "$RUNNER_TEMP/copy-env/bin/python" scripts/copy-postgres.py
+          "$RUNNER_TEMP/copy-env/bin/python" scripts/copy-postgres.py --apply
+      - run: npx tsx scripts/mysql-smoke.ts
+      - run: npm run typecheck && npm run build
+      - name: Boot and check auth and admin search against MySQL
+        run: |
+          export ADMIN_API_KEY="$(openssl rand -hex 32)" BETTER_AUTH_SECRET="$(openssl rand -hex 32)"
+          node dist/index.js &
+          trap 'kill "$!"' EXIT
+          api=http://localhost:8787
+          curl -fsS --retry 12 --retry-connrefused "$api/healthz"
+          curl -fsS -c "$RUNNER_TEMP/session" -H 'Content-Type: application/json' \
+            -d '{"email":"ci@example.test","username":"ci_trainer","name":"Trainer","password":"ci-password-only"}' \
+            "$api/api/auth/sign-up/email" >/dev/null
+          curl -fsS -b "$RUNNER_TEMP/session" "$api/api/auth/get-session" | jq -e '.user.username == "ci_trainer"'
+          curl -fsS -H "x-admin-key: $ADMIN_API_KEY" "$api/api/admin/users?q=ALICE" | jq -e '.total == 1 and .users[0].isAdmin == true'
 
   game:
     name: Game typecheck + build

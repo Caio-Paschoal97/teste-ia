@@ -10,6 +10,7 @@ declare global {
 export const prisma =
   global.__prisma ??
   new PrismaClient({
+    transactionOptions: { isolationLevel: "ReadCommitted" },
     log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
   });
 

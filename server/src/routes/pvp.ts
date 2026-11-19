@@ -409,7 +409,7 @@ app.get("/me/ladder", requireUser, async (c) => {
 async function readMilestonesSafe(userId: string): Promise<number[]> {
   try {
     const rows = await prisma.$queryRaw<{ threshold: number }[]>`
-      SELECT "threshold"::int AS threshold FROM "PvpBadgeMilestone" WHERE "userId" = ${userId}
+      SELECT threshold FROM PvpBadgeMilestone WHERE userId = ${userId}
     `;
     return rows.map((r) => Number(r.threshold));
   } catch (e) {

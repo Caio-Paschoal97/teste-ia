@@ -186,7 +186,7 @@ function PrivacyContent() {
       </ul>
       <h4>Where it lives</h4>
       <p>
-        The database is hosted on Railway (Postgres). The site itself is
+        The database is hosted on Railway (MySQL). The site itself is
         served from a CDN. If you sign in with Google, Google sees the
         sign-in event per their own privacy policy.
       </p>

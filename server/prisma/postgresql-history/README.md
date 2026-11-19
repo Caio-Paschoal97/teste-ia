@@ -1,3 +1,5 @@
+> **Archive (PostgreSQL only).** These historical instructions are not the active deployment workflow. For MySQL see [MYSQL.md](../../MYSQL.md).
+
 # Migrations
 
 Production is managed by **Prisma Migrate**. Do not run `prisma db push`

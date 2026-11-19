@@ -36,14 +36,14 @@ app.post("/", requireUser, async (c) => {
   const id = "br_" + randomBytes(9).toString("hex");
   const { title, description, page, userAgent, context } = parsed.data;
   // Raw SQL because Prisma codegen for new models can lag locally; the
-  // table itself is in sync via `prisma db push` on Railway boot.
+  // table itself is in sync via `prisma migrate deploy` on Railway boot.
   await prisma.$executeRaw`
-    INSERT INTO "BugReport"
-      ("id","reporterId","reporterName","title","description","page","userAgent","context","status","createdAt","updatedAt")
+    INSERT INTO BugReport
+      (id,reporterId,reporterName,title,description,page,userAgent,context,status,createdAt,updatedAt)
     VALUES
       (${id}, ${user.id}, ${user.username}, ${title}, ${description},
        ${page ?? null}, ${userAgent ?? null}, ${context ?? null},
-       'open', NOW(), NOW())
+       'open', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
   `;
   return c.json({ ok: true, id });
 });

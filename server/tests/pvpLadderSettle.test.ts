@@ -3,7 +3,7 @@
 // The policy tests (pvpLadderPolicy.test.ts) prove the arithmetic. This file
 // proves the things only the database can arbitrate, against a fake Postgres
 // that enforces the REAL constraints from
-// prisma/migrations/20260730120000_add_pvp_ladder/migration.sql:
+// prisma/migrations/0_mysql/migration.sql:
 //
 //   * PvpLadderEarn."userId" / "opponentUserId" FOREIGN KEY → User(id)
 //     — THE BOT GATE. A synthetic bot id raises 23503 and takes both sides'
@@ -152,19 +152,19 @@ class FakeDb {
       // same aggregate in so the panel prices the bonus exactly as the payout
       // does. So the two MULTI-column statements are claimed by their own
       // distinctive markers first, and the bare witnessed read is what is left.
-      if (sql.includes('COALESCE(SUM(e."bp") FILTER')) return "read.status";
-      if (sql.includes('FROM "PvpLadderEarn" e') && sql.includes('FILTER (WHERE e."opponentUserId"')) return "read.sideLedger";
+      if (sql.includes('AS matches_window')) return "read.status";
+      if (sql.includes('FROM PvpLadderEarn e') && sql.includes('AS meetings')) return "read.sideLedger";
       // Deliberately NOT windowed: the witnessed climb that prices the cash
       // bonus is a lifetime sum.
       if (sql.includes("AS witnessed_delta")) return "read.witnessed";
-      if (sql.includes('FROM "PvpBadgeMilestone" WHERE')) return "read.milestones";
-      if (sql.includes('ORDER BY "createdAt" DESC')) return "read.history";
-      if (sql.includes('INSERT INTO "PvpLadderEarn"')) return "insert.earn";
-      if (sql.includes('INSERT INTO "PvpWinBonusClaim"')) return "claim.winBonus";
-      if (sql.includes('INSERT INTO "PvpBadgeMilestone"')) return "insert.milestone";
-      if (sql.includes('UPDATE "PvpLadderEarn"')) return "update.earn";
-      if (sql.includes('INSERT INTO "PvpLadderBaseline"')) return "insert.baseline";
-      if (sql.includes('FROM "PvpLadderBaseline"')) return "read.baseline";
+      if (sql.includes('FROM PvpBadgeMilestone WHERE')) return "read.milestones";
+      if (sql.includes('ORDER BY createdAt DESC')) return "read.history";
+      if (sql.includes('INSERT INTO PvpLadderEarn')) return "insert.earn";
+      if (sql.includes('INSERT INTO PvpWinBonusClaim')) return "claim.winBonus";
+      if (sql.includes('INSERT INTO PvpBadgeMilestone')) return "insert.milestone";
+      if (sql.includes('UPDATE PvpLadderEarn')) return "update.earn";
+      if (sql.includes('INSERT INTO PvpLadderBaseline')) return "insert.baseline";
+      if (sql.includes('FROM PvpLadderBaseline')) return "read.baseline";
       // A statement the fake does not model. Fail loudly rather than silently
       // returning "no rows", which would make a broken query look like a
       // legitimate refusal.
@@ -173,7 +173,7 @@ class FakeDb {
 
     /** The one assertion that matters most, enforced at the lowest level. */
     const refuseSaveWrites = (sql: string) => {
-      if (/UPDATE\s+"User"/i.test(sql) || /saveData|saveVersion|saveAdoptSeq/.test(sql)) {
+      if (/UPDATE\s+User/i.test(sql) || /saveData|saveVersion|saveAdoptSeq/.test(sql)) {
         throw new Error(
           "FakeDb: a PvP reward tried to write the SAVE PATH. This is the exact bug "
           + "the PendingGrant inbox exists to avoid — payment must be a grant row.",
@@ -232,6 +232,7 @@ class FakeDb {
       // ── Raw SQL for the three tables this change adds ────────────
       $queryRaw: async (strings: TemplateStringsArray, ...values: any[]) => {
         const sql = Array.isArray(strings) ? strings.join("?") : String(strings);
+        if (sql.includes("SELECT matchId FROM PvpWinBonusClaim")) return self.bonusClaims.filter(b => b.userId === values[0]);
         refuseSaveWrites(sql);
         const kind = classify(sql);
         self.log.push(kind);
@@ -1342,7 +1343,7 @@ describe("every failure path records an error", () => {
     expect(call).toBeTruthy();
     expect((call![0] as any).meta).toMatchObject({
       relation: "PvpLadderEarn",
-      migration: "20260730120000_add_pvp_ladder",
+      migration: "0_mysql",
     });
     expect(String((call![0] as any).meta.remedy)).toMatch(/migrate deploy/);
   });
@@ -1360,7 +1361,7 @@ describe("every failure path records an error", () => {
     const call = h.recordError.mock.calls.find(
       (c) => (c[0] as any).message === "pvp_ladder_migration_missing",
     );
-    expect((call![0] as any).meta.migration).toBe("20260730130000_add_pvp_ladder_baseline");
+    expect((call![0] as any).meta.migration).toBe("0_mysql");
   });
 
   it("does NOT call an ordinary failure a missing migration", async () => {

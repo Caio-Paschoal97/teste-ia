@@ -20,10 +20,14 @@ Three independent npm packages — no top-level workspace. Each has its own `pac
 
 ```bash
 # 1. Server
+# From the repository root (do not overwrite an existing .env)
+cp -n server/.env.example server/.env
+# Edit server/.env: local MySQL credentials + a random BETTER_AUTH_SECRET
+docker compose --env-file server/.env up -d --wait mysql
 cd server
-cp .env.example .env       # fill in DATABASE_URL + BETTER_AUTH_SECRET
-npm install
-npm run db:push            # apply Prisma schema
+npm ci
+npm run db:generate
+npm run db:deploy
 npm run dev                # → http://localhost:8787
 
 # 2. Game (in a new terminal)
@@ -41,15 +45,17 @@ Sign in with the email you set as `ADMIN_BOOTSTRAP_EMAIL` in `.env` to auto-prom
 
 ## Production deploy
 
-- **Server**: Railway with a Postgres plugin. Set `DATABASE_URL`, `BETTER_AUTH_SECRET` (32+ random bytes), `BETTER_AUTH_URL`, `FRONTEND_ORIGIN` (comma-separated game + admin URLs), `ADMIN_BOOTSTRAP_EMAIL`, optionally `GOOGLE_CLIENT_ID/SECRET`. Server refuses to boot in `NODE_ENV=production` if `BETTER_AUTH_SECRET` is unset or still the dev default.
+- **Server**: Railway with a MySQL 8.4 service. Set `DATABASE_URL`, `BETTER_AUTH_SECRET` (32+ random bytes), `BETTER_AUTH_URL`, `FRONTEND_ORIGIN` (comma-separated game + admin URLs), `ADMIN_BOOTSTRAP_EMAIL`, optionally `GOOGLE_CLIENT_ID/SECRET`. Server refuses to boot in `NODE_ENV=production` if `BETTER_AUTH_SECRET` is unset or still the dev default.
 - **Game / Admin**: any static host (Vercel, Netlify, Railway static, etc.). Set `VITE_SERVER_URL` at build time pointing at your server URL.
+
+For existing databases, follow the [PostgreSQL → MySQL cutover guide](server/MYSQL.md) before deploying. No seed is required.
 
 Full deploy notes in [server/README.md](server/README.md).
 
 ## Tech
 
 - **Frontend**: React 18 + Vite + TypeScript. State is `useReducer` + Context. Battle resolver is an event-driven simulator that emits typed events the UI consumes one-at-a-time for typewriter-paced animations.
-- **Backend**: Hono on Node, Better Auth for email/Google OAuth, Prisma → Postgres in prod (SQLite locally), Socket.IO for chat / presence / trades.
+- **Backend**: Hono on Node, Better Auth for email/Google OAuth, Prisma → MySQL 8.4, Socket.IO for chat / presence / trades.
 - **Anti-cheat**: server-side save validation (IV/EV/move/level bounds), rate limits on auth + saves + chat + trade events, server-canonical Pokémon swap on trade lock-in (clients can't dupe by lying about ownership), session enforcement (newest cookie wins).
 - **Sprites**: Gen 5 Black/White animated set from the PokeAPI sprites repo via jsDelivr. Game ships only species with IDs ≤ 649 to keep the sprite set 100% available.
 

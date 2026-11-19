@@ -410,8 +410,8 @@
 // drifting copy of these numbers.
 //
 // BOTH migrations, and the order matters — verified read-only against production
-// on 2026-07-30: 20260730120000_add_pvp_ladder IS applied (06:14Z, its three
-// tables exist), and 20260730130000_add_pvp_ladder_baseline is NOT. Flipping the
+// on 2026-07-30: 0_mysql IS applied (06:14Z, its three
+// tables exist), and 0_mysql is NOT. Flipping the
 // switch before the second one lands means every rated battle raises 42P01 on
 // "PvpLadderBaseline", pays nothing and logs pvp_ladder_settle_failed. That is
 // the fail-closed direction and it is loud, but it is also a wasted evening, so:
@@ -597,7 +597,7 @@ export const LADDER_MAX_BP_ONE_ACCOUNT_ONE_WINDOW =
  * compressed.
  *
  * Arbitrated by PvpWinBonusClaim — ONE ROW PER ACCOUNT, claimed with
- * `INSERT … ON CONFLICT ("userId") DO UPDATE … WHERE "claimedAt" <= cutoff`,
+ * a conditional duplicate-key update (only when claimedAt <= cutoff),
  * which takes a row lock on the conflicting row and so serialises concurrent
  * claims. Strictly stronger than the (userId, day) primary key it replaces:
  * that key could be satisfied twice by two different day values.
@@ -1239,10 +1239,10 @@ function newLadderRowId(): string {
 /** The tables this feature adds, and the migration that creates each — so a
  *  42P01 can be turned into an instruction instead of a mystery. */
 const LADDER_RELATIONS: readonly { relation: string; migration: string }[] = [
-  { relation: "PvpLadderBaseline", migration: "20260730130000_add_pvp_ladder_baseline" },
-  { relation: "PvpLadderEarn", migration: "20260730120000_add_pvp_ladder" },
-  { relation: "PvpWinBonusClaim", migration: "20260730120000_add_pvp_ladder" },
-  { relation: "PvpBadgeMilestone", migration: "20260730120000_add_pvp_ladder" },
+  { relation: "PvpLadderBaseline", migration: "0_mysql" },
+  { relation: "PvpLadderEarn", migration: "0_mysql" },
+  { relation: "PvpWinBonusClaim", migration: "0_mysql" },
+  { relation: "PvpBadgeMilestone", migration: "0_mysql" },
 ];
 
 /**
@@ -1257,8 +1257,7 @@ const LADDER_RELATIONS: readonly { relation: string; migration: string }[] = [
 function missingLadderRelation(e: unknown): { relation: string; migration: string } | null {
   const err = e as { code?: unknown; meta?: { code?: unknown } } | null;
   const text = String(e);
-  const code = String(err?.code ?? err?.meta?.code ?? "");
-  if (code !== "42P01" && !text.includes("42P01") && !/does not exist/i.test(text)) return null;
+  if (String(err?.meta?.code) !== "1146" && err?.code !== "P2021" && !/does not exist|doesn't exist/i.test(text)) return null;
   return LADDER_RELATIONS.find((r) => text.includes(r.relation)) ?? null;
 }
 
@@ -1267,6 +1266,14 @@ interface SideLedgerRead {
   milestoneBpInWindow: number;
   meetings: number;
   winBonusOnCooldown: boolean;
+}
+
+// MySQL rolls back only the failed INSERT on duplicate key. Unlike INSERT
+// IGNORE this never swallows FK, CHECK or data truncation failures.
+function ignoreDuplicateKey(error: unknown): number {
+  const e = error as { code?: string; meta?: { code?: string } };
+  if (e.code === "P2010" && String(e.meta?.code) === "1062") return 0;
+  throw error;
 }
 
 async function readSideLedger(
@@ -1286,7 +1293,7 @@ async function readSideLedger(
   // `milestone_window` beside it is the SECOND cap, which reads the other column
   // and only that column. Two sums, two budgets, neither able to eat the other.
   //
-  // Adding a column here deliberately adds NO bind parameter: the fake Postgres
+  // Adding a column here deliberately adds NO bind parameter: the fake DB
   // in tests/pvpLadderSettle.test.ts routes on statement shape and POSITIONAL
   // parameters, so a new placeholder in the middle of this statement would
   // silently re-map every value after it.
@@ -1294,13 +1301,13 @@ async function readSideLedger(
     bp_window: number; milestone_window: number; meetings: number; bonus_on_cooldown: number;
   }[]>`
     SELECT
-      COALESCE(SUM(e."bp"), 0)::int AS bp_window,
-      COALESCE(SUM(e."milestoneBp"), 0)::int AS milestone_window,
-      COUNT(*) FILTER (WHERE e."opponentUserId" = ${opponentUserId})::int AS meetings,
-      (SELECT COUNT(*) FROM "PvpWinBonusClaim" w
-        WHERE w."userId" = ${userId} AND w."claimedAt" > ${bonusCutoff})::int AS bonus_on_cooldown
-    FROM "PvpLadderEarn" e
-    WHERE e."userId" = ${userId} AND e."createdAt" > ${windowStart}
+      COALESCE(SUM(e.bp), 0) AS bp_window,
+      COALESCE(SUM(e.milestoneBp), 0) AS milestone_window,
+      COUNT(CASE WHEN e.opponentUserId = ${opponentUserId} THEN 1 END) AS meetings,
+      (SELECT COUNT(*) FROM PvpWinBonusClaim w
+        WHERE w.userId = ${userId} AND w.claimedAt > ${bonusCutoff}) AS bonus_on_cooldown
+    FROM PvpLadderEarn e
+    WHERE e.userId = ${userId} AND e.createdAt > ${windowStart}
   `;
   const r = rows[0];
   return {
@@ -1331,7 +1338,7 @@ async function readSideLedger(
  * conservative for the one match per account where the post-Elo peak is
  * ambiguous (see the MILESTONE FAUCET block in the header).
  *
- * ON CONFLICT DO NOTHING is the whole idempotency story: the row is written once
+ * The no-op duplicate-key update is the idempotency guarantee: the row is written once
  * and NEVER revised. Revising it would move the baseline up behind the player
  * and make every subsequent milestone unpayable.
  */
@@ -1342,23 +1349,20 @@ async function readBaselines(
 ): Promise<Map<string, number>> {
   for (const side of sides) {
     await tx.$executeRaw`
-      INSERT INTO "PvpLadderBaseline" ("userId","rating","source","createdAt")
-      SELECT pr."userId",
-             -- ::int for the same reason the day parameter is cast to ::date
-             -- above: a bind parameter's inferred type decides GREATEST's result
-             -- type, and the target column is INTEGER.
-             GREATEST(pr."peakRating", pr."rating", ${side.ratingAfter}::int),
+      INSERT INTO PvpLadderBaseline (userId,rating,source,createdAt)
+      SELECT pr.userId,
+             GREATEST(pr.peakRating, pr.rating, ${side.ratingAfter}),
              'settle',
              ${now}
-        FROM "PlayerRating" pr
-       WHERE pr."userId" = ${side.userId}
-      ON CONFLICT ("userId") DO NOTHING
+        FROM PlayerRating pr
+       WHERE pr.userId = ${side.userId}
+      ON DUPLICATE KEY UPDATE rating = PvpLadderBaseline.rating
     `;
   }
   const rows = await tx.$queryRaw<{ userId: string; rating: number }[]>`
-    SELECT "userId", "rating"::int AS rating
-      FROM "PvpLadderBaseline"
-     WHERE "userId" IN (${sides[0]?.userId ?? ""}, ${sides[1]?.userId ?? ""})
+    SELECT userId, rating
+      FROM PvpLadderBaseline
+     WHERE userId IN (${sides[0]?.userId ?? ""}, ${sides[1]?.userId ?? ""})
   `;
   const out = new Map<string, number>();
   for (const r of rows) out.set(String(r.userId), Number(r.rating));
@@ -1372,7 +1376,7 @@ async function readBaselines(
  * This is the number that prices the cash bonus (see
  * LADDER_WITNESSED_BASE_RATING). It is a SEPARATE statement from readSideLedger
  * rather than another column on it for two reasons: readSideLedger is scoped to
- * the rolling window and this must not be, and the fake Postgres in
+ * the rolling window and this must not be, and the fake DB in
  * tests/pvpLadderSettle.test.ts routes on statement shape and POSITIONAL
  * parameters, so folding a differently-scoped aggregate into that statement
  * would have re-mapped every value after it.
@@ -1387,16 +1391,16 @@ async function readWitnessedClimb(
   userId: string,
 ): Promise<number> {
   const rows = await tx.$queryRaw<{ witnessed_delta: number }[]>`
-    SELECT COALESCE(SUM(e."ratingDelta"), 0)::int AS witnessed_delta
-      FROM "PvpLadderEarn" e
-     WHERE e."userId" = ${userId}
+    SELECT COALESCE(SUM(e.ratingDelta), 0) AS witnessed_delta
+      FROM PvpLadderEarn e
+     WHERE e.userId = ${userId}
   `;
   return Number(rows[0]?.witnessed_delta ?? 0);
 }
 
 async function readMilestones(tx: Prisma.TransactionClient, userId: string): Promise<number[]> {
   const rows = await tx.$queryRaw<{ threshold: number }[]>`
-    SELECT "threshold"::int AS threshold FROM "PvpBadgeMilestone" WHERE "userId" = ${userId}
+    SELECT threshold FROM PvpBadgeMilestone WHERE userId = ${userId}
   `;
   return rows.map((r) => Number(r.threshold));
 }
@@ -1419,9 +1423,9 @@ async function readMilestones(tx: Prisma.TransactionClient, userId: string): Pro
  *     twice, a retry, a duplicated event) inserts zero rows, and zero rows
  *     rolls the whole transaction back before a single grant exists.
  *   * `PvpWinBonusClaim ("userId")` primary key with a CONDITIONAL upsert — the
- *     cash bonus. `ON CONFLICT DO UPDATE … WHERE "claimedAt" <= cutoff` takes a
+ *     cash bonus. The conditional duplicate-key update takes a
  *     row lock on the existing row, so two battles finishing in the same instant
- *     serialise: the second sees the first's timestamp and affects zero rows,
+ *     serialise: the second sees the first's timestamp and leaves its claim intact,
  *     and that side simply does not get the bonus. Exception-free, so it needs
  *     no savepoint and cannot poison the transaction. Unlike a (userId, day)
  *     key, it also cannot be satisfied twice by straddling midnight.
@@ -1570,12 +1574,12 @@ export async function settleLadderEarn(input: SettleLadderInput): Promise<Settle
         const id = newLadderRowId();
         rowIds.push(id);
         const affected = await tx.$executeRaw`
-          INSERT INTO "PvpLadderEarn" (
-            "id","matchId","userId","opponentUserId","day","provenance","result","endReason",
-            "turns","durationMs","ratingBefore","ratingAfter","ratingDelta","meetingIndex",
-            "bpBeforeDecay","tier","bp","milestoneBp","moneyAwarded","winBonusPaid","createdAt"
+          INSERT INTO PvpLadderEarn (
+            id,matchId,userId,opponentUserId,day,provenance,result,endReason,
+            turns,durationMs,ratingBefore,ratingAfter,ratingDelta,meetingIndex,
+            bpBeforeDecay,tier,bp,milestoneBp,moneyAwarded,winBonusPaid,createdAt
           ) VALUES (
-            ${id}, ${input.matchId}, ${side.userId}, ${side.opponentUserId}, ${day}::date,
+            ${id}, ${input.matchId}, ${side.userId}, ${side.opponentUserId}, ${day},
             ${shape.provenance as string}, ${side.result}, ${input.endReason},
             ${shape.turns}, ${shape.durationMs},
             ${side.ratingBefore}, ${side.ratingAfter},
@@ -1583,8 +1587,7 @@ export async function settleLadderEarn(input: SettleLadderInput): Promise<Settle
             ${side.bpBeforeDecay}, ${side.tier},
             0, 0, 0, false, ${now}
           )
-          ON CONFLICT ("matchId","userId") DO NOTHING
-        `;
+        `.catch(ignoreDuplicateKey);
         // Zero affected rows means this (match, side) is already in the ledger:
         // endBattle was invoked twice, or a retry replayed the settle. Throwing
         // rolls back the row(s) this attempt already inserted, so a replay
@@ -1599,38 +1602,38 @@ export async function settleLadderEarn(input: SettleLadderInput): Promise<Settle
 
         // ── The once-per-cooldown gate ─────────────────────────────
         // The read above is only a hint; THIS is the arbiter. One row per
-        // account, and the WHERE on the DO UPDATE takes that row's lock, so
-        // concurrent claims serialise and the loser affects zero rows rather
-        // than raising a 23505 that would poison the transaction.
+        // account; concurrent claims serialize under its exclusive lock.
         //
         // There is no calendar day in this predicate, which is the whole point:
         // a cooldown cannot be straddled.
         let winBonus = false;
         if (side.winBonus) {
-          const claimed = await tx.$executeRaw`
-            INSERT INTO "PvpWinBonusClaim" ("userId","claimedAt","day","matchId","rating","tier","money")
-            VALUES (${side.userId}, ${now}, ${day}::date, ${input.matchId},
-                    ${side.pricedRating}, ${side.tier}, ${side.money})
-            ON CONFLICT ("userId") DO UPDATE
-              SET "claimedAt" = EXCLUDED."claimedAt",
-                  "day"       = EXCLUDED."day",
-                  "matchId"   = EXCLUDED."matchId",
-                  "rating"    = EXCLUDED."rating",
-                  "tier"      = EXCLUDED."tier",
-                  "money"     = EXCLUDED."money"
-              WHERE "PvpWinBonusClaim"."claimedAt" <= ${bonusCutoff}
+          // Gate each assignment on the old timestamp. MySQL evaluates the
+          // assignments left-to-right, so claimedAt MUST be changed last.
+          await tx.$executeRaw`
+            INSERT INTO PvpWinBonusClaim (userId,claimedAt,day,matchId,rating,tier,money)
+            VALUES (${side.userId}, ${now}, ${day}, ${input.matchId}, ${side.pricedRating}, ${side.tier}, ${side.money}) AS incoming
+            ON DUPLICATE KEY UPDATE
+              matchId = IF(PvpWinBonusClaim.claimedAt <= ${bonusCutoff}, incoming.matchId, PvpWinBonusClaim.matchId),
+              day = IF(PvpWinBonusClaim.claimedAt <= ${bonusCutoff}, incoming.day, PvpWinBonusClaim.day),
+              rating = IF(PvpWinBonusClaim.claimedAt <= ${bonusCutoff}, incoming.rating, PvpWinBonusClaim.rating),
+              tier = IF(PvpWinBonusClaim.claimedAt <= ${bonusCutoff}, incoming.tier, PvpWinBonusClaim.tier),
+              money = IF(PvpWinBonusClaim.claimedAt <= ${bonusCutoff}, incoming.money, PvpWinBonusClaim.money),
+              claimedAt = IF(PvpWinBonusClaim.claimedAt <= ${bonusCutoff}, incoming.claimedAt, PvpWinBonusClaim.claimedAt)
           `;
-          winBonus = claimed === 1;
+          // Do not interpret affectedRows: a no-op's count depends on CLIENT_FOUND_ROWS.
+          const [owner] = await tx.$queryRaw<{ matchId: string }[]>`
+            SELECT matchId FROM PvpWinBonusClaim WHERE userId = ${side.userId} FOR UPDATE`;
+          winBonus = owner.matchId === input.matchId;
         }
 
         // ── The once-ever milestone gate, same shape ───────────────
         const wonMilestones: LadderMilestoneAward[] = [];
         for (const ms of side.milestones) {
           const claimed = await tx.$executeRaw`
-            INSERT INTO "PvpBadgeMilestone" ("userId","threshold","ratingBefore","ratingAtAward","bp")
+            INSERT INTO PvpBadgeMilestone (userId,threshold,ratingBefore,ratingAtAward,bp)
             VALUES (${side.userId}, ${ms.threshold}, ${ms.ratingBefore}, ${ms.ratingAtAward}, ${ms.bp})
-            ON CONFLICT ("userId","threshold") DO NOTHING
-          `;
+          `.catch(ignoreDuplicateKey);
           if (claimed === 1) wonMilestones.push(ms);
         }
 
@@ -1667,10 +1670,10 @@ export async function settleLadderEarn(input: SettleLadderInput): Promise<Settle
         // — recomputing them later under a changed policy would yield a number
         // nobody was paid, which makes an audit worthless.
         await tx.$executeRaw`
-          UPDATE "PvpLadderEarn"
-          SET "bp" = ${bp}, "milestoneBp" = ${milestoneBp}, "moneyAwarded" = ${money},
-              "winBonusPaid" = ${winBonus}, "grantId" = ${grantId}
-          WHERE "id" = ${rowId}
+          UPDATE PvpLadderEarn
+          SET bp = ${bp}, milestoneBp = ${milestoneBp}, moneyAwarded = ${money},
+              winBonusPaid = ${winBonus}, grantId = ${grantId}
+          WHERE id = ${rowId}
         `;
 
         outcomes.push({
@@ -1802,18 +1805,18 @@ export async function readLadderStatus(
     milestone_lifetime: number; witnessed_delta: number; bonus_at: Date | null;
   }[]>`
     SELECT
-      COALESCE(SUM(e."bp") FILTER (WHERE e."createdAt" > ${windowStart}), 0)::int AS bp_window,
-      COUNT(*) FILTER (WHERE e."createdAt" > ${windowStart})::int AS matches_window,
-      COALESCE(SUM(e."bp"), 0)::int AS bp_lifetime,
-      COALESCE(SUM(e."milestoneBp"), 0)::int AS milestone_lifetime,
+      COALESCE(SUM(CASE WHEN e.createdAt > ${windowStart} THEN e.bp ELSE 0 END), 0) AS bp_window,
+      COUNT(CASE WHEN e.createdAt > ${windowStart} THEN 1 END) AS matches_window,
+      COALESCE(SUM(e.bp), 0) AS bp_lifetime,
+      COALESCE(SUM(e.milestoneBp), 0) AS milestone_lifetime,
       -- The witnessed climb, unwindowed and unfiltered, exactly as
       -- readWitnessedClimb computes it inside the settle. Adding it here costs
       -- no extra bind parameter and no extra round trip, which matters because
-      -- the fake Postgres in tests routes on positional parameters.
-      COALESCE(SUM(e."ratingDelta"), 0)::int AS witnessed_delta,
-      (SELECT w."claimedAt" FROM "PvpWinBonusClaim" w WHERE w."userId" = ${userId}) AS bonus_at
-    FROM "PvpLadderEarn" e
-    WHERE e."userId" = ${userId}
+      -- the fake DB in tests routes on positional parameters.
+      COALESCE(SUM(e.ratingDelta), 0) AS witnessed_delta,
+      (SELECT w.claimedAt FROM PvpWinBonusClaim w WHERE w.userId = ${userId}) AS bonus_at
+    FROM PvpLadderEarn e
+    WHERE e.userId = ${userId}
   `;
   const r = rows[0];
   const bpEarnedInWindow = Number(r?.bp_window ?? 0);
@@ -1874,12 +1877,12 @@ export interface LadderHistoryRow {
 export async function readLadderHistory(userId: string, limit = 25): Promise<LadderHistoryRow[]> {
   const take = Math.min(100, Math.max(1, Math.floor(limit)));
   const rows = await prisma.$queryRaw<any[]>`
-    SELECT "matchId","opponentUserId","day","provenance","result","bp","milestoneBp",
-           "moneyAwarded","winBonusPaid","tier","meetingIndex","bpBeforeDecay","turns",
-           "ratingDelta","ratingAfter","createdAt"
-    FROM "PvpLadderEarn"
-    WHERE "userId" = ${userId}
-    ORDER BY "createdAt" DESC
+    SELECT matchId,opponentUserId,day,provenance,result,bp,milestoneBp,
+           moneyAwarded,winBonusPaid,tier,meetingIndex,bpBeforeDecay,turns,
+           ratingDelta,ratingAfter,createdAt
+    FROM PvpLadderEarn
+    WHERE userId = ${userId}
+    ORDER BY createdAt DESC
     LIMIT ${take}
   `;
   return rows.map((r) => {

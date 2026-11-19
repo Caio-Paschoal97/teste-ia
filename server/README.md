@@ -5,19 +5,23 @@ Backend for the multiplayer Pokemon idle game. Hono + Prisma + Better Auth + Soc
 ## Local dev
 
 ```bash
+# From the repository root (do not overwrite an existing .env)
+cp -n server/.env.example server/.env
+# Edit server/.env: local MySQL credentials + a random BETTER_AUTH_SECRET
+docker compose --env-file server/.env up -d --wait mysql
 cd server
-cp .env.example .env       # then edit values; defaults work for local SQLite
-npm install
-npm run db:push            # creates SQLite db and applies schema
+npm ci
+npm run db:generate
+npm run db:deploy
 npm run dev                # starts on http://localhost:8787
 ```
 
 ## Production (Railway)
 
-1. Create a Railway project with a Postgres plugin
+1. Create a Railway project with a MySQL 8.4 service
 2. Add a service from the `server/` directory
 3. Set env vars:
-   - `DATABASE_URL` (auto-injected by Railway Postgres plugin)
+   - `DATABASE_URL` (reference the MySQL service URL, with the mysql:// scheme)
    - `BETTER_AUTH_SECRET` (32-byte random string)
    - `BETTER_AUTH_URL` (your backend URL)
    - `FRONTEND_ORIGIN` (comma-separated allowlist — game URL **and** admin URL,
@@ -25,11 +29,11 @@ npm run dev                # starts on http://localhost:8787
    - `ADMIN_BOOTSTRAP_EMAIL` (the email that auto-promotes to admin on first sign-in)
    - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` (optional, for Google login)
    - `NODE_ENV=production`
-4. The Prisma schema already targets `postgresql`. No edit needed.
-5. Build: `npm install && npx prisma generate && npx prisma db push && npm run build`
-   (use `prisma migrate deploy` instead of `db push` once you start tracking
-   migrations; for now the project is unmigrated and uses `db push`).
-6. Start: `npm start`
+4. Build: `npm ci && npm run db:generate && npm run build`.
+5. Start: `npm run db:deploy && npm start` (see `railway.json`). There is no seed step.
+
+**Existing data:** do not just switch the URL. Follow [MYSQL.md](MYSQL.md) for
+backup, staged transfer, verification, privileges and rollback.
 
 The game and admin frontends each get built separately (`npm run build` in
 `game/` and `admin/`) and deployed to a static host (Vercel, Netlify, Railway

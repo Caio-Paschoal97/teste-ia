@@ -13,7 +13,7 @@ import { randomBytes } from "node:crypto";
 // lib/audit.ts: the Prisma client codegen locks the query-engine DLL on
 // Windows while the dev server runs, so a freshly-added model is not in
 // the generated types until the next clean deploy. The table itself is
-// created by scripts/ensure-daily-active.ts.
+// created by Prisma Migrate.
 
 // Fire-and-forget: presence must never be able to fail a socket
 // connection. If the table is missing (code deployed ahead of the
@@ -30,21 +30,21 @@ export async function recordDailyActive(userId: string): Promise<void> {
   const id = "da_" + randomBytes(9).toString("hex");
 
   try {
-    // ON CONFLICT DO NOTHING makes this idempotent per (user, day) —
+    // The no-op duplicate-key update makes this idempotent per (user, day) —
     // a player who reconnects 40 times today still produces one row.
     await prisma.$executeRaw`
-      INSERT INTO "DailyActive" ("id", "userId", "day")
+      INSERT INTO DailyActive (id, userId, day)
       VALUES (${id}, ${userId}, ${day})
-      ON CONFLICT ("userId", "day") DO NOTHING
+      ON DUPLICATE KEY UPDATE id = DailyActive.id
     `;
   } catch (e) {
     const msg = String(e);
-    if (/does not exist|no such table/i.test(msg)) {
+    if (/does not exist|doesn't exist|no such table/i.test(msg)) {
       if (!warnedMissingTable) {
         warnedMissingTable = true;
         console.error(
           "[presence] DailyActive table is missing — DAU will not be recorded. " +
-          "Run: npx tsx scripts/ensure-daily-active.ts"
+          "Run: npm run db:deploy"
         );
       }
       return;

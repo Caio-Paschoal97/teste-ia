@@ -70,12 +70,12 @@ export async function recordError(input: ErrorLogInput): Promise<void> {
   if (process.env.NODE_ENV !== "production") return;
   try {
     await prisma.$executeRaw`
-      INSERT INTO "ErrorLog"
-        ("id","kind","level","message","stack","source","userId","username","userAgent","meta","createdAt")
+      INSERT INTO ErrorLog
+        (id,kind,level,message,stack,source,userId,username,userAgent,meta,createdAt)
       VALUES
         (${id}, ${input.kind}, ${level}, ${input.message}, ${input.stack ?? null},
          ${input.source ?? null}, ${input.userId ?? null}, ${input.username ?? null},
-         ${input.userAgent ?? null}, ${metaJson}, NOW())
+         ${input.userAgent ?? null}, ${metaJson}, UTC_TIMESTAMP(3))
     `;
   } catch (e) {
     // If the DB itself is unhappy, log + drop — never let logging break the

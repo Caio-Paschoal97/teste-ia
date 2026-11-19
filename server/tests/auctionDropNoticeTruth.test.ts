@@ -195,7 +195,7 @@ describe("the proxy-paused notice is a claim about MONEY and must be true", () =
     seed(500_000, 500_000_000);
     const res = await bid(510_000);
     expect(res.status).toBe(200);
-    expect(res.body.youAreHighBidder).toBe(true);
+    expect(res.body).toMatchObject({ youAreHighBidder: true });
     // He is told he was outbid, which is exactly what happened...
     expect(outbid()).toBeTruthy();
     // ...and NOT that his balance ran out, which did not happen.
@@ -207,7 +207,7 @@ describe("the proxy-paused notice is a claim about MONEY and must be true", () =
     seed(50_000_000, 505_000);
     const res = await bid(600_000);
     expect(res.status).toBe(200);
-    expect(res.body.youAreHighBidder).toBe(true);
+    expect(res.body).toMatchObject({ youAreHighBidder: true });
     const d = dropped();
     expect(d).toBeTruthy();
     expect(d!.userId).toBe("u2");

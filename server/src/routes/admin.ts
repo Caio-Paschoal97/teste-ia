@@ -1,3 +1,5 @@
+import { Prisma, type User } from "@prisma/client";
+import { errorFingerprint, fetchErrorGroups } from "../lib/errorFingerprint.js";
 import { Hono } from "hono";
 import { z } from "zod";
 import { prisma } from "../db.js";
@@ -73,15 +75,7 @@ app.get("/me", (c) => {
 // Sortable columns. An allow-list rather than passing the query param
 // through to Prisma — `orderBy` takes a field name, and forwarding user
 // input there lets a caller order by any column on the model.
-const USER_SORTS = {
-  createdAt:          (dir: "asc" | "desc") => ({ createdAt: dir }),
-  lastSeenAt:         (dir: "asc" | "desc") => ({ lastSeenAt: dir }),
-  accountLevel:       (dir: "asc" | "desc") => ({ accountLevel: dir }),
-  pokedexCaughtCount: (dir: "asc" | "desc") => ({ pokedexCaughtCount: dir }),
-  totalCaughtLevels:  (dir: "asc" | "desc") => ({ totalCaughtLevels: dir }),
-  username:           (dir: "asc" | "desc") => ({ username: dir }),
-} as const;
-type UserSort = keyof typeof USER_SORTS;
+const USER_SORTS = ["createdAt", "lastSeenAt", "accountLevel", "pokedexCaughtCount", "totalCaughtLevels", "username"];
 
 app.get("/users", async (c) => {
   const q = (c.req.query("q") ?? "").trim();
@@ -92,54 +86,32 @@ app.get("/users", async (c) => {
   // ever see the newest 25 accounts — there was no way to ask "who has
   // the highest level" (the shape a cheat looks like) or "who has not
   // played in a month".
-  const sortRaw = (c.req.query("sort") ?? "createdAt") as UserSort;
-  const sort: UserSort = sortRaw in USER_SORTS ? sortRaw : "createdAt";
+  const sortRaw = c.req.query("sort") ?? "createdAt";
+  const sort = USER_SORTS.includes(sortRaw) ? sortRaw : "createdAt";
   const dir: "asc" | "desc" = c.req.query("dir") === "asc" ? "asc" : "desc";
 
   // Filters. `banned` and `admin` are the two the operator actually
   // reaches for — "show me everyone I have banned", "who has admin".
   const filter = (c.req.query("filter") ?? "").trim();
-  const filterWhere =
-      filter === "banned" ? { bannedUntil: { gt: new Date() } }
-    : filter === "admins" ? { isAdmin: true }
-    : {};
-
-  const searchWhere = q
-    ? {
-        OR: [
-          { username: { contains: q, mode: "insensitive" as const } },
-          { email: { contains: q, mode: "insensitive" as const } },
-          { name: { contains: q, mode: "insensitive" as const } },
-        ],
-      }
-    : {};
-  const where = { ...searchWhere, ...filterWhere };
-
-  const [total, users] = await Promise.all([
-    prisma.user.count({ where }),
-    prisma.user.findMany({
-      where,
-      orderBy: USER_SORTS[sort](dir),
-      skip: page * pageSize,
-      take: pageSize,
-      select: {
-        id: true,
-        username: true,
-        email: true,
-        name: true,
-        accountLevel: true,
-        pokedexCaughtCount: true,
-        totalCaughtLevels: true,
-        isAdmin: true,
-        bannedUntil: true,
-        banReason: true,
-        createdAt: true,
-        lastSeenAt: true,
-      },
-    }),
+  const conditions: Prisma.Sql[] = [];
+  if (filter === "banned") conditions.push(Prisma.sql`bannedUntil > ${new Date()}`);
+  if (filter === "admins") conditions.push(Prisma.sql`isAdmin = true`);
+  if (q) {
+    const pattern = `%${q}%`;
+    conditions.push(Prisma.sql`(LOWER(username) LIKE LOWER(${pattern}) OR LOWER(email) LIKE LOWER(${pattern}) OR LOWER(name) LIKE LOWER(${pattern}))`);
+  }
+  const where = conditions.length ? Prisma.sql`WHERE ${Prisma.join(conditions, " AND ")}` : Prisma.empty;
+  // Only sort/dir are SQL tokens (both allowlisted). Keep filtering and pagination
+  // in the database; a broad search must not materialize every matching ID.
+  const [[{ total }], rows] = await Promise.all([
+    prisma.$queryRaw<{ total: bigint }[]>`SELECT COUNT(*) AS total FROM User ${where}`,
+    prisma.$queryRaw<Pick<User, "id" | "username" | "email" | "name" | "accountLevel" |
+      "pokedexCaughtCount" | "totalCaughtLevels" | "isAdmin" | "bannedUntil" | "banReason" | "createdAt" | "lastSeenAt">[]>`
+      SELECT id, username, email, name, accountLevel, pokedexCaughtCount, totalCaughtLevels,
+             isAdmin, bannedUntil, banReason, createdAt, lastSeenAt FROM User ${where}
+      ORDER BY ${Prisma.raw(sort)} ${Prisma.raw(dir)} LIMIT ${pageSize} OFFSET ${page * pageSize}`,
   ]);
-
-  return c.json({ total, page, pageSize, users });
+  return c.json({ total: Number(total), page, pageSize, users: rows.map(r => ({ ...r, isAdmin: Boolean(r.isAdmin) })) });
 });
 
 // Detail view — includes save data for inspection. Logged to the audit
@@ -1286,7 +1258,7 @@ app.get("/analytics", async (c) => {
   //
   // Everything above is a workaround for not having per-day activity
   // rows. This is the real thing. Both are wrapped in a tolerant try:
-  // the table is created by scripts/ensure-daily-active.ts, and if the
+  // the table is created by Prisma Migrate, and if the
   // code is deployed ahead of that, analytics must degrade rather than
   // 500 the operator's landing page.
   //
@@ -1300,14 +1272,14 @@ app.get("/analytics", async (c) => {
 
   try {
     const dauRows = await prisma.$queryRaw<{ day: Date; count: bigint }[]>`
-      SELECT "day", COUNT(DISTINCT "userId")::bigint AS count
-        FROM "DailyActive"
-       WHERE "day" >= ${thirtyDaysAgo}
-       GROUP BY "day"
-       ORDER BY "day" ASC
+      SELECT day, COUNT(DISTINCT userId) AS count
+        FROM DailyActive
+       WHERE day >= ${thirtyDaysAgo}
+       GROUP BY day
+       ORDER BY day ASC
     `;
     const [firstRow] = await prisma.$queryRaw<{ day: Date }[]>`
-      SELECT "day" FROM "DailyActive" ORDER BY "day" ASC LIMIT 1
+      SELECT day FROM DailyActive ORDER BY day ASC LIMIT 1
     `;
     dauCollectingSince = firstRow ? firstRow.day.toISOString().slice(0, 10) : null;
 
@@ -1339,19 +1311,18 @@ app.get("/analytics", async (c) => {
       if (!dauCollectingSince || checkDay.toISOString().slice(0, 10) < dauCollectingSince) {
         return { rate: null, size: 0 };
       }
-      const cohort = await prisma.user.findMany({
+      const size = await prisma.user.count({
         where: { createdAt: { gte: cohortStart, lt: cohortEnd } },
-        select: { id: true },
       });
-      if (cohort.length === 0) return { rate: null, size: 0 };
-      const ids = cohort.map((u) => u.id);
+      if (size === 0) return { rate: null, size: 0 };
+
       const [{ count }] = await prisma.$queryRaw<{ count: bigint }[]>`
-        SELECT COUNT(DISTINCT "userId")::bigint AS count
-          FROM "DailyActive"
-         WHERE "day" = ${checkDay}
-           AND "userId" = ANY(${ids})
+        SELECT COUNT(DISTINCT userId) AS count
+          FROM DailyActive
+         WHERE day = ${checkDay}
+           AND userId IN (SELECT id FROM User WHERE createdAt >= ${cohortStart} AND createdAt < ${cohortEnd})
       `;
-      return { rate: (Number(count) / cohort.length) * 100, size: cohort.length };
+      return { rate: (Number(count) / size) * 100, size };
     };
 
     const [r1, r7, r30] = await Promise.all([
@@ -1362,7 +1333,7 @@ app.get("/analytics", async (c) => {
       cohortSizes: { d1: r1.size, d7: r7.size, d30: r30.size },
     };
   } catch (e) {
-    if (!/does not exist|no such table/i.test(String(e))) {
+    if (!/does not exist|doesn't exist|no such table/i.test(String(e))) {
       console.error("[analytics] DailyActive query failed", String(e));
     }
     // Leave dauSeries/retention null — the dashboard renders a
@@ -1484,7 +1455,7 @@ app.get("/analytics", async (c) => {
   });
 });
 
-// ── Map editor: positions in Postgres so they survive deploys and can
+// ── Map editor: positions in MySQL so they survive deploys and can
 // be read by the game frontend at boot. The game's hard-coded routes.ts
 // values stay around as defaults; DB rows override them per location.
 app.get("/map-positions", async (c) => {
@@ -1576,30 +1547,22 @@ app.get("/chat/recent", async (c) => {
   const q = (c.req.query("q") ?? "").trim();
   const username = (c.req.query("username") ?? "").trim();
 
-  const where: any = {};
-  if (channel && channel !== "all") {
-    if (channel === "global") where.channelId = "global";
-    else if (channel === "area") where.channelId = { startsWith: "area:" };
-    else if (channel === "dm")   where.channelId = { startsWith: "dm:" };
-    else where.channelId = channel;
-  }
-  if (q) where.content = { contains: q, mode: "insensitive" };
+  const conditions: Prisma.Sql[] = [];
+  if (channel === "area" || channel === "dm") conditions.push(Prisma.sql`m.channelId LIKE ${channel + ":%"}`);
+  else if (channel && channel !== "all") conditions.push(Prisma.sql`m.channelId = ${channel}`);
+  if (q) conditions.push(Prisma.sql`LOWER(m.content) LIKE LOWER(${"%" + q + "%"})`);
   if (username) {
-    where.user = {
-      OR: [
-        { username: { contains: username, mode: "insensitive" } },
-        { name:     { contains: username, mode: "insensitive" } },
-      ],
-    };
+    const pattern = `%${username}%`;
+    conditions.push(Prisma.sql`(LOWER(u.username) LIKE LOWER(${pattern}) OR LOWER(u.name) LIKE LOWER(${pattern}))`);
   }
-
+  const where = conditions.length ? Prisma.sql`WHERE ${Prisma.join(conditions, " AND ")}` : Prisma.empty;
   const [messages, channelGroups] = await Promise.all([
-    prisma.chatMessage.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      take: limit,
-      include: { user: { select: { id: true, username: true, name: true, isAdmin: true, accountLevel: true } } },
-    }),
+    prisma.$queryRaw<{ id: string }[]>`
+      SELECT m.id FROM ChatMessage m JOIN User u ON m.userId = u.id ${where}
+      ORDER BY m.createdAt DESC, m.id DESC LIMIT ${limit}`.then(rows => prisma.chatMessage.findMany({
+        where: { id: { in: rows.map(r => r.id) } }, orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        include: { user: { select: { id: true, username: true, name: true, isAdmin: true, accountLevel: true } } },
+      })),
     // Channel facets — count messages by channelId so the admin sees
     // which channels are noisiest at a glance. Limit to public channels
     // (global + trade + area:*) because DMs leak addressee info.
@@ -2505,17 +2468,7 @@ app.get("/live-ops", async (c) => {
 // most-recent-first, no filtering UI yet, capped at 200 rows.
 app.get("/audit", async (c) => {
   const limit = Math.min(200, Math.max(1, parseInt(c.req.query("limit") ?? "100", 10)));
-  // Raw SQL to dodge the codegen-locked Prisma client (see lib/audit.ts);
-  // safe because limit is a parsed integer and the rest is static SQL.
-  const rows = await prisma.$queryRawUnsafe<{
-    id: string; adminId: string; action: string; targetId: string | null;
-    meta: string | null; createdAt: Date;
-  }[]>(
-    `SELECT "id","adminId","action","targetId","meta","createdAt"
-       FROM "AdminAudit"
-       ORDER BY "createdAt" DESC
-       LIMIT ${limit}`
-  );
+  const rows = await prisma.adminAudit.findMany({ orderBy: { createdAt: "desc" }, take: limit });
   // Decorate with usernames so the dashboard doesn't need a second
   // fetch per row. Two lookups: distinct admin ids + distinct target ids.
   const adminIds = Array.from(new Set(rows.map((r) => r.adminId)));
@@ -2548,23 +2501,9 @@ app.get("/bug-reports", async (c) => {
   const status = (c.req.query("status") ?? "").trim();
   const limit = Math.min(200, Math.max(1, parseInt(c.req.query("limit") ?? "50", 10)));
   const offset = Math.max(0, parseInt(c.req.query("offset") ?? "0", 10));
-  // Compose WHERE without breaking parameterisation — use $queryRaw with
-  // a Prisma.sql conditional. Prisma's tagged template interpolates safely.
-  const rows = status
-    ? await prisma.$queryRawUnsafe<any[]>(
-        `SELECT "id","reporterId","reporterName","title","description","page","userAgent","context","status","adminNotes","createdAt","updatedAt"
-           FROM "BugReport"
-          WHERE "status" = $1
-          ORDER BY "createdAt" DESC
-          LIMIT ${limit} OFFSET ${offset}`,
-        status
-      )
-    : await prisma.$queryRawUnsafe<any[]>(
-        `SELECT "id","reporterId","reporterName","title","description","page","userAgent","context","status","adminNotes","createdAt","updatedAt"
-           FROM "BugReport"
-          ORDER BY "createdAt" DESC
-          LIMIT ${limit} OFFSET ${offset}`
-      );
+  const rows = await prisma.bugReport.findMany({
+    where: status ? { status } : {}, orderBy: { createdAt: "desc" }, take: limit, skip: offset,
+  });
   return c.json({ reports: rows });
 });
 
@@ -2577,11 +2516,11 @@ app.patch("/bug-reports/:id", async (c) => {
     return c.json({ error: "invalid status" }, 400);
   }
   await prisma.$executeRaw`
-    UPDATE "BugReport"
-       SET "status" = COALESCE(${newStatus ?? null}, "status"),
-           "adminNotes" = COALESCE(${body.adminNotes ?? null}, "adminNotes"),
-           "updatedAt" = NOW()
-     WHERE "id" = ${id}
+    UPDATE BugReport
+       SET status = COALESCE(${newStatus ?? null}, status),
+           adminNotes = COALESCE(${body.adminNotes ?? null}, adminNotes),
+           updatedAt = UTC_TIMESTAMP(3)
+     WHERE id = ${id}
   `;
   void makeAudit(c)(me.id, "bugReport.update", id, { status: newStatus, adminNotes: body.adminNotes });
   return c.json({ ok: true });
@@ -2601,8 +2540,7 @@ app.patch("/bug-reports/:id", async (c) => {
 // 3,000 and not "200+". A groupBy answers over the whole table
 // regardless of any row cap.
 // message with variable data (ids, uuids, timestamps, digit runs)
-// normalized to placeholders — see error_message_fingerprint()
-// (migration 20260717050000). Exact-string grouping fragments one real
+// normalized to placeholders — see lib/errorFingerprint.ts. Exact-string grouping fragments one real
 // error type into many groups whenever a message embeds instance data
 // (a save version, a raw exception's dynamic text), which is exactly
 // what made this log look far noisier than it actually was.
@@ -2619,43 +2557,7 @@ app.get("/errors/groups", async (c) => {
   const since = new Date(Date.now() - days * 86400000);
   const kindFilter = kind === "server" || kind === "client" ? kind : null;
 
-  const rows = await prisma.$queryRaw<{
-    kind: string; fingerprint: string; sampleMessage: string; count: bigint; latestAt: Date;
-    sampleId: string; sampleLevel: string; sampleSource: string | null; sampleStack: string | null;
-    sampleUserId: string | null; sampleUsername: string | null; sampleUserAgent: string | null;
-  }[]>`
-    WITH scored AS (
-      SELECT
-        "id", "kind", "level", "message", "stack", "source",
-        "userId", "username", "userAgent", "createdAt",
-        error_message_fingerprint("message") AS fingerprint,
-        COUNT(*) OVER (PARTITION BY "kind", error_message_fingerprint("message")) AS "groupCount",
-        MAX("createdAt") OVER (PARTITION BY "kind", error_message_fingerprint("message")) AS "groupLatestAt",
-        ROW_NUMBER() OVER (
-          PARTITION BY "kind", error_message_fingerprint("message")
-          ORDER BY "createdAt" DESC
-        ) AS rn
-      FROM "ErrorLog"
-      WHERE "createdAt" >= ${since}
-        AND (${kindFilter}::text IS NULL OR "kind" = ${kindFilter})
-    )
-    SELECT
-      "kind", fingerprint,
-      "message"       AS "sampleMessage",
-      "groupCount"    AS count,
-      "groupLatestAt" AS "latestAt",
-      "id"            AS "sampleId",
-      "level"         AS "sampleLevel",
-      "source"        AS "sampleSource",
-      "stack"         AS "sampleStack",
-      "userId"        AS "sampleUserId",
-      "username"      AS "sampleUsername",
-      "userAgent"     AS "sampleUserAgent"
-    FROM scored
-    WHERE rn = 1
-    ORDER BY "groupCount" DESC
-    LIMIT 100;
-  `;
+  const rows = await fetchErrorGroups(since, kindFilter ?? undefined, 100);
 
   const groups = rows.map((g) => ({
     kind: g.kind,
@@ -2697,8 +2599,8 @@ app.post("/errors/clear-group", async (c) => {
   }
   const { kind, fingerprint } = parsed.data;
   const deleted = await prisma.$executeRaw`
-    DELETE FROM "ErrorLog"
-     WHERE "kind" = ${kind} AND error_message_fingerprint("message") = ${fingerprint}
+    DELETE FROM ErrorLog
+     WHERE kind = ${kind} AND ${errorFingerprint} = ${fingerprint}
   `;
   void makeAudit(c)(me.id, "errors.clear_group", null, {
     kind,
@@ -2717,25 +2619,11 @@ app.get("/errors", async (c) => {
   // fingerprint included so the dashboard's grouped-view drill-down can
   // join occurrences to a group correctly — joining on raw "message"
   // silently drops sibling rows whose message differs only in embedded
-  // variable data (see error_message_fingerprint(), migration
-  // 20260717050000).
-  const rows = kind === "server" || kind === "client"
-    ? await prisma.$queryRawUnsafe<any[]>(
-        `SELECT "id","kind","level","message","stack","source","userId","username","userAgent","meta","createdAt",
-                error_message_fingerprint("message") AS fingerprint
-           FROM "ErrorLog"
-          WHERE "kind" = $1
-          ORDER BY "createdAt" DESC
-          LIMIT ${limit}`,
-        kind
-      )
-    : await prisma.$queryRawUnsafe<any[]>(
-        `SELECT "id","kind","level","message","stack","source","userId","username","userAgent","meta","createdAt",
-                error_message_fingerprint("message") AS fingerprint
-           FROM "ErrorLog"
-          ORDER BY "createdAt" DESC
-          LIMIT ${limit}`
-      );
+  // variable data (see lib/errorFingerprint.ts).
+  const rows = await prisma.$queryRaw<any[]>`
+    SELECT *, ${errorFingerprint} AS fingerprint FROM ErrorLog
+    ${kind === "server" || kind === "client" ? Prisma.sql`WHERE kind = ${kind}` : Prisma.empty}
+    ORDER BY createdAt DESC LIMIT ${limit}`;
   // `total` lets the table say "showing 500 of 3,412" instead of
   // implying the 500 it rendered is everything there is.
   const total = await prisma.errorLog.count({

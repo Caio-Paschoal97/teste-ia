@@ -1,0 +1,3 @@
+# Optional offline transfer utility only (not backend dependencies).
+psycopg[binary]>=3.2,<4
+PyMySQL[rsa]>=1.1,<2

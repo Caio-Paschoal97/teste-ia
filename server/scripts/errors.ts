@@ -13,74 +13,17 @@
 // source/stack. Grouping by the raw message would fragment one real
 // error type into many groups whenever a message embeds instance data
 // (a save version, a raw exception's dynamic text, an id) — see
-// error_message_fingerprint() (migration 20260717050000), a Postgres
-// function that collapses the obviously-variable parts of a message to
+// lib/errorFingerprint.ts, the shared MySQL expression that collapses the obviously-variable parts of a message to
 // stable placeholders before anything groups on it. Prisma's groupBy()
 // can't group on a computed expression, so this is raw SQL.
 
+import { errorFingerprint, fetchErrorGroups } from "../src/lib/errorFingerprint.js";
 import { prisma } from "../src/db.js";
 
 function arg(flag: string, def?: string): string | undefined {
   const i = process.argv.indexOf(flag);
   if (i < 0) return def;
   return process.argv[i + 1] ?? def;
-}
-
-interface GroupRow {
-  kind: string;
-  fingerprint: string;
-  sampleMessage: string;
-  count: bigint;
-  latestAt: Date;
-  sampleId: string;
-  sampleLevel: string;
-  sampleSource: string | null;
-  sampleStack: string | null;
-  sampleUserId: string | null;
-  sampleUsername: string | null;
-  sampleUserAgent: string | null;
-}
-
-// One query: fingerprint-normalize, count + pick the newest row per
-// group via a window function, no per-group round trip. The old
-// version did groupBy() then Promise.all(rows.map(findFirst)) — up to
-// `limit`+1 concurrent connections for a single CLI invocation, which
-// is a real way to help exhaust a Postgres instance near its
-// max_connections ceiling.
-async function fetchGroups(since: Date, kind: string | undefined, limit: number): Promise<GroupRow[]> {
-  return prisma.$queryRaw<GroupRow[]>`
-    WITH scored AS (
-      SELECT
-        "id", "kind", "level", "message", "stack", "source",
-        "userId", "username", "userAgent", "createdAt",
-        error_message_fingerprint("message") AS fingerprint,
-        COUNT(*) OVER (PARTITION BY "kind", error_message_fingerprint("message")) AS "groupCount",
-        MAX("createdAt") OVER (PARTITION BY "kind", error_message_fingerprint("message")) AS "groupLatestAt",
-        ROW_NUMBER() OVER (
-          PARTITION BY "kind", error_message_fingerprint("message")
-          ORDER BY "createdAt" DESC
-        ) AS rn
-      FROM "ErrorLog"
-      WHERE "createdAt" >= ${since}
-        AND (${kind ?? null}::text IS NULL OR "kind" = ${kind ?? null})
-    )
-    SELECT
-      "kind", fingerprint,
-      "message"       AS "sampleMessage",
-      "groupCount"    AS count,
-      "groupLatestAt" AS "latestAt",
-      "id"            AS "sampleId",
-      "level"         AS "sampleLevel",
-      "source"        AS "sampleSource",
-      "stack"         AS "sampleStack",
-      "userId"        AS "sampleUserId",
-      "username"      AS "sampleUsername",
-      "userAgent"     AS "sampleUserAgent"
-    FROM scored
-    WHERE rn = 1
-    ORDER BY "groupCount" DESC
-    LIMIT ${limit};
-  `;
 }
 
 async function main() {
@@ -93,7 +36,7 @@ async function main() {
     const limit = parseInt(arg("--limit", "50") ?? "50", 10);
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-    const rows = await fetchGroups(since, kind, limit);
+    const rows = await fetchErrorGroups(since, kind, limit);
     const groups = rows.map((g) => ({
       kind: g.kind,
       fingerprint: g.fingerprint,
@@ -159,14 +102,12 @@ async function main() {
     if (kind !== "client" && kind !== "server") throw new Error("--kind must be client or server");
 
     const preview = await prisma.$queryRaw<{ fingerprint: string; sampleMessage: string; count: bigint }[]>`
-      SELECT
-        error_message_fingerprint("message") AS fingerprint,
-        (array_agg("message" ORDER BY "createdAt" DESC))[1] AS "sampleMessage",
-        COUNT(*) AS count
-      FROM "ErrorLog"
-      WHERE "kind" = ${kind} AND "message" ILIKE ${"%" + contains + "%"}
-      GROUP BY fingerprint
-      ORDER BY count DESC
+      WITH ranked AS (
+        SELECT message, ${errorFingerprint} AS fingerprint,
+               ROW_NUMBER() OVER (PARTITION BY SHA2(${errorFingerprint}, 256) ORDER BY createdAt DESC, id DESC) AS rn,
+               COUNT(*) OVER (PARTITION BY SHA2(${errorFingerprint}, 256)) AS n
+          FROM ErrorLog WHERE kind = ${kind} AND message LIKE ${"%" + contains + "%"}
+      ) SELECT fingerprint, message AS sampleMessage, n AS count FROM ranked WHERE rn = 1 ORDER BY n DESC
     `;
     if (preview.length === 0) {
       console.log(JSON.stringify({ matched: 0, deleted: 0 }, null, 2));

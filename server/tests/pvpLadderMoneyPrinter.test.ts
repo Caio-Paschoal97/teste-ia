@@ -9,7 +9,7 @@
 //      PVP_LADDER_REWARDS=1. A bot room built by a test is only as good as the
 //      test author's copy of socket.ts; a bot room built BY socket.ts is the
 //      actual artefact.
-//   2. Its fake Postgres models ROW LOCKS and READ COMMITTED, not
+//   2. Its fake DB models ROW LOCKS and READ COMMITTED, not
 //      snapshot/restore, so "the cash bonus is arbitrated by a conditional
 //      upsert, not by arithmetic" is a claim two concurrent transactions can
 //      actually falsify.
@@ -96,7 +96,8 @@ const h = vi.hoisted(() => {
       },
       $queryRaw: async (strings: TemplateStringsArray, ...values: any[]) => {
         const sql = strings.join("?");
-        if (sql.includes('FROM "PvpLadderEarn" e')) {
+        if (sql.includes("SELECT matchId FROM PvpWinBonusClaim")) return state.bonusClaims.filter(b => b.userId === values[0]);
+        if (sql.includes('FROM PvpLadderEarn e')) {
           const [opponentId, , bonusCutoff, userId, windowStart] = values;
           const mine = state.earns.filter(
             (e) => e.userId === userId && e.createdAt.getTime() > windowStart.getTime(),
@@ -110,12 +111,12 @@ const h = vi.hoisted(() => {
             ).length,
           }];
         }
-        if (sql.includes('FROM "PvpBadgeMilestone"')) {
+        if (sql.includes('FROM PvpBadgeMilestone')) {
           return state.milestones.filter((m) => m.userId === values[0]).map((m) => ({ threshold: m.threshold }));
         }
-        if (sql.includes('FROM "PvpLadderBaseline"')) {
+        if (sql.includes('FROM PvpLadderBaseline')) {
           if (!state.baselineTableExists) {
-            throw new Error('42P01: relation "PvpLadderBaseline" does not exist');
+            throw new Error("1146: Table 'db.PvpLadderBaseline' doesn't exist");
           }
           return state.baselines.filter((b) => values.includes(b.userId));
         }
@@ -125,7 +126,7 @@ const h = vi.hoisted(() => {
         const sql = strings.join("?");
         const held = tx?.done ?? Promise.resolve();
 
-        if (sql.includes('INSERT INTO "PvpLadderEarn"')) {
+        if (sql.includes('INSERT INTO PvpLadderEarn')) {
           // `tier` is captured rather than skipped: it records WHICH rating
           // priced the payment, which is how a clamped payout stays visible in
           // the audit instead of only in the amount.
@@ -152,13 +153,13 @@ const h = vi.hoisted(() => {
           });
         }
 
-        if (sql.includes('INSERT INTO "PvpWinBonusClaim"')) {
-          const [userId, claimedAt, , , , , , cutoff] = values;
+        if (sql.includes('INSERT INTO PvpWinBonusClaim')) {
+          const [userId, claimedAt, , matchId, , , , cutoff] = values;
           if (!state.users.has(userId)) throw new Error(`23503 FK violation: ${userId}`);
           return withKey(`bonus:${userId}`, held, async () => {
             const existing = state.bonusClaims.find((b) => b.userId === userId);
             if (!existing) {
-              const row = { userId, claimedAt };
+              const row = { userId, claimedAt, matchId };
               state.bonusClaims.push(row);
               journal(() => {
                 const i = state.bonusClaims.indexOf(row);
@@ -167,14 +168,14 @@ const h = vi.hoisted(() => {
               return 1;
             }
             if (existing.claimedAt.getTime() > cutoff.getTime()) return 0;
-            const prev = existing.claimedAt;
-            existing.claimedAt = claimedAt;
-            journal(() => { existing.claimedAt = prev; });
+            const prev = { claimedAt: existing.claimedAt, matchId: existing.matchId };
+            Object.assign(existing, { claimedAt, matchId });
+            journal(() => { Object.assign(existing, prev); });
             return 1;
           });
         }
 
-        if (sql.includes('INSERT INTO "PvpBadgeMilestone"')) {
+        if (sql.includes('INSERT INTO PvpBadgeMilestone')) {
           const [userId, threshold, ratingBefore, , bp] = values;
           if (!state.users.has(userId)) throw new Error(`23503 FK violation: ${userId}`);
           // CHECK PvpBadgeMilestone_crossed
@@ -189,9 +190,9 @@ const h = vi.hoisted(() => {
           });
         }
 
-        if (sql.includes('INSERT INTO "PvpLadderBaseline"')) {
+        if (sql.includes('INSERT INTO PvpLadderBaseline')) {
           if (!state.baselineTableExists) {
-            throw new Error('42P01: relation "PvpLadderBaseline" does not exist');
+            throw new Error("1146: Table 'db.PvpLadderBaseline' doesn't exist");
           }
           const [ratingAfter, createdAt, userId] = values;
           const pr = state.ratings.get(userId);
@@ -208,7 +209,7 @@ const h = vi.hoisted(() => {
           });
         }
 
-        if (sql.includes('UPDATE "PvpLadderEarn"')) {
+        if (sql.includes('UPDATE PvpLadderEarn')) {
           const [bp, milestoneBp, moneyAwarded, winBonusPaid, grantId, id] = values;
           // CHECK PvpLadderEarn_money_needs_bonus / _nonneg
           if (moneyAwarded !== 0 && !winBonusPaid) throw new Error("23514 money_needs_bonus");
@@ -878,7 +879,7 @@ describe("PRINT ATTEMPT: would enabling this TODAY pay the four live accounts?",
     // logging a generic failure on every rated battle for an evening.
     expect(h.state.errors.map((e) => e.message)).toContain("pvp_ladder_migration_missing");
     const err = h.state.errors.find((e) => e.message === "pvp_ladder_migration_missing");
-    expect(err.meta.migration).toBe("20260730130000_add_pvp_ladder_baseline");
+    expect(err.meta.migration).toBe("0_mysql");
     expect(String(err.meta.remedy)).toMatch(/migrate deploy/);
   });
 });

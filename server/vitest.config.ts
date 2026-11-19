@@ -15,7 +15,7 @@ export default defineConfig({
     // Belt and braces: if a test forgets to mock db.ts, make sure the real
     // DATABASE_URL from server/.env can never be picked up.
     env: {
-      DATABASE_URL: "postgresql://vitest:vitest@127.0.0.1:1/refuse_to_connect",
+      DATABASE_URL: "mysql://vitest:vitest@127.0.0.1:1/refuse_to_connect",
       NODE_ENV: "test",
       ALERT_WEBHOOK_URL: "",
     },

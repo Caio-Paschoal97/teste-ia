@@ -8,7 +8,7 @@ import { randomBytes } from "node:crypto";
 //
 // Implemented via raw SQL because the Prisma client codegen on Windows
 // locks the query-engine DLL while the dev server is running; the
-// AdminAudit table exists in the DB (db push synced it) but the client
+// AdminAudit table exists in the DB (Migrate created it) but the client
 // types don't yet know about it. The next clean deploy will regenerate
 // and we can switch to prisma.adminAudit.create().
 
@@ -22,8 +22,8 @@ export async function audit(
   const metaJson = meta ? JSON.stringify(meta) : null;
   try {
     await prisma.$executeRaw`
-      INSERT INTO "AdminAudit" ("id", "adminId", "action", "targetId", "meta", "createdAt")
-      VALUES (${id}, ${adminId}, ${action}, ${targetId}, ${metaJson}, NOW())
+      INSERT INTO AdminAudit (id, adminId, action, targetId, meta, createdAt)
+      VALUES (${id}, ${adminId}, ${action}, ${targetId}, ${metaJson}, UTC_TIMESTAMP(3))
     `;
   } catch (e) {
     // The action already happened; we'd rather log the audit failure

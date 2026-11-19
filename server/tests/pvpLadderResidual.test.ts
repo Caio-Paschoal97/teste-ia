@@ -95,6 +95,7 @@ const h = vi.hoisted(() => {
     },
     $queryRaw: async (strings: TemplateStringsArray, ...values: any[]) => {
       const sql = strings.join("?");
+        if (sql.includes("SELECT matchId FROM PvpWinBonusClaim")) return state.bonusClaims.filter(b => b.userId === values[0]);
       // The WITNESSED climb: lifetime sum of this account's ledger ratingDelta.
       // Matched before the windowed read below — both select FROM PvpLadderEarn.
       if (sql.includes("AS witnessed_delta")) {
@@ -105,7 +106,7 @@ const h = vi.hoisted(() => {
             .reduce((a, e) => a + Number(e.ratingDelta ?? 0), 0),
         }];
       }
-      if (sql.includes('FROM "PvpLadderEarn" e')) {
+      if (sql.includes('FROM PvpLadderEarn e')) {
         const [opponentId, , bonusCutoff, userId, windowStart] = values;
         const mine = state.earns.filter(
           (e) => e.userId === userId && e.createdAt.getTime() > windowStart.getTime(),
@@ -119,12 +120,12 @@ const h = vi.hoisted(() => {
           ).length,
         }];
       }
-      if (sql.includes('FROM "PvpBadgeMilestone"')) {
+      if (sql.includes('FROM PvpBadgeMilestone')) {
         return state.milestones
           .filter((m) => m.userId === values[0])
           .map((m) => ({ threshold: m.threshold }));
       }
-      if (sql.includes('FROM "PvpLadderBaseline"')) {
+      if (sql.includes('FROM PvpLadderBaseline')) {
         if (state.baselineTableMissing) throw missingRelation("PvpLadderBaseline");
         return state.baselines.filter((b) => values.includes(b.userId));
       }
@@ -132,7 +133,7 @@ const h = vi.hoisted(() => {
     },
     $executeRaw: async (strings: TemplateStringsArray, ...values: any[]) => {
       const sql = strings.join("?");
-      if (sql.includes('INSERT INTO "PvpLadderEarn"')) {
+      if (sql.includes('INSERT INTO PvpLadderEarn')) {
         // `tier` is CAPTURED, not skipped: it is the column that records which
         // rating actually priced the payment, so a clamped payout is visible in
         // the audit rather than only in the amount.
@@ -151,21 +152,21 @@ const h = vi.hoisted(() => {
         });
         return 1;
       }
-      if (sql.includes('INSERT INTO "PvpWinBonusClaim"')) {
-        const [userId, claimedAt, , , , , , cutoff] = values;
+      if (sql.includes('INSERT INTO PvpWinBonusClaim')) {
+        const [userId, claimedAt, , matchId, , , , cutoff] = values;
         const existing = state.bonusClaims.find((b) => b.userId === userId);
-        if (!existing) { state.bonusClaims.push({ userId, claimedAt }); return 1; }
+        if (!existing) { state.bonusClaims.push({ userId, claimedAt, matchId }); return 1; }
         if (existing.claimedAt.getTime() > cutoff.getTime()) return 0;
-        existing.claimedAt = claimedAt;
+        Object.assign(existing, { claimedAt, matchId });
         return 1;
       }
-      if (sql.includes('INSERT INTO "PvpBadgeMilestone"')) {
+      if (sql.includes('INSERT INTO PvpBadgeMilestone')) {
         const [userId, threshold, , , bp] = values;
         if (state.milestones.some((m) => m.userId === userId && m.threshold === threshold)) return 0;
         state.milestones.push({ userId, threshold, bp });
         return 1;
       }
-      if (sql.includes('INSERT INTO "PvpLadderBaseline"')) {
+      if (sql.includes('INSERT INTO PvpLadderBaseline')) {
         if (state.baselineTableMissing) throw missingRelation("PvpLadderBaseline");
         const [ratingAfter, createdAt, userId] = values;
         const pr = state.ratings.get(userId);
@@ -176,7 +177,7 @@ const h = vi.hoisted(() => {
         });
         return 1;
       }
-      if (sql.includes('UPDATE "PvpLadderEarn"')) {
+      if (sql.includes('UPDATE PvpLadderEarn')) {
         const [bp, milestoneBp, moneyAwarded, winBonusPaid, grantId, id] = values;
         const row = state.earns.find((e) => e.id === id);
         if (row) Object.assign(row, { bp, milestoneBp, moneyAwarded, winBonusPaid, grantId });
@@ -539,7 +540,7 @@ describe("the deploy-order hazard is diagnosable, not just fail-closed", () => {
     // …and now LOUD in the way an operator can act on at 3am.
     const err = h.state.errors.find((e) => e.message === "pvp_ladder_migration_missing");
     expect(err).toBeTruthy();
-    expect(String(err.meta.migration)).toContain("20260730130000_add_pvp_ladder_baseline");
+    expect(String(err.meta.migration)).toContain("0_mysql");
     expect(String(err.meta.remedy)).toMatch(/migrate/i);
   });
 

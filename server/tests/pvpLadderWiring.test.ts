@@ -90,7 +90,8 @@ const h = vi.hoisted(() => {
     },
     $queryRaw: async (strings: TemplateStringsArray, ...values: any[]) => {
       const sql = strings.join("?");
-      if (sql.includes('FROM "PvpLadderEarn" e')) {
+        if (sql.includes("SELECT matchId FROM PvpWinBonusClaim")) return state.bonusClaims.filter(b => b.userId === values[0]);
+      if (sql.includes('FROM PvpLadderEarn e')) {
         const [opponentId, , bonusCutoff, userId, windowStart] = values;
         const mine = state.earns.filter(
           (e) => e.userId === userId && e.createdAt.getTime() > windowStart.getTime(),
@@ -104,19 +105,19 @@ const h = vi.hoisted(() => {
           ).length,
         }];
       }
-      if (sql.includes('FROM "PvpBadgeMilestone"')) {
+      if (sql.includes('FROM PvpBadgeMilestone')) {
         return state.milestones
           .filter((m) => m.userId === values[0])
           .map((m) => ({ threshold: m.threshold }));
       }
-      if (sql.includes('FROM "PvpLadderBaseline"')) {
+      if (sql.includes('FROM PvpLadderBaseline')) {
         return state.baselines.filter((b) => values.includes(b.userId));
       }
       throw new Error(`unmodelled query: ${sql}`);
     },
     $executeRaw: async (strings: TemplateStringsArray, ...values: any[]) => {
       const sql = strings.join("?");
-      if (sql.includes('INSERT INTO "PvpLadderEarn"')) {
+      if (sql.includes('INSERT INTO PvpLadderEarn')) {
         const [id, matchId, userId, opponentUserId, , provenance, result, endReason,
           turns, durationMs, ratingBefore, ratingAfter, ratingDelta, meetingIndex,
           , , createdAt] = values;
@@ -134,21 +135,21 @@ const h = vi.hoisted(() => {
         });
         return 1;
       }
-      if (sql.includes('INSERT INTO "PvpWinBonusClaim"')) {
-        const [userId, claimedAt, , , , , , cutoff] = values;
+      if (sql.includes('INSERT INTO PvpWinBonusClaim')) {
+        const [userId, claimedAt, , matchId, , , , cutoff] = values;
         const existing = state.bonusClaims.find((b) => b.userId === userId);
-        if (!existing) { state.bonusClaims.push({ userId, claimedAt }); return 1; }
+        if (!existing) { state.bonusClaims.push({ userId, claimedAt, matchId }); return 1; }
         if (existing.claimedAt.getTime() > cutoff.getTime()) return 0;
-        existing.claimedAt = claimedAt;
+        Object.assign(existing, { claimedAt, matchId });
         return 1;
       }
-      if (sql.includes('INSERT INTO "PvpBadgeMilestone"')) {
+      if (sql.includes('INSERT INTO PvpBadgeMilestone')) {
         const [userId, threshold, , , bp] = values;
         if (state.milestones.some((m) => m.userId === userId && m.threshold === threshold)) return 0;
         state.milestones.push({ userId, threshold, bp });
         return 1;
       }
-      if (sql.includes('INSERT INTO "PvpLadderBaseline"')) {
+      if (sql.includes('INSERT INTO PvpLadderBaseline')) {
         const [ratingAfter, createdAt, userId] = values;
         const pr = state.ratings.get(userId);
         if (!pr) return 0;
@@ -158,7 +159,7 @@ const h = vi.hoisted(() => {
         });
         return 1;
       }
-      if (sql.includes('UPDATE "PvpLadderEarn"')) {
+      if (sql.includes('UPDATE PvpLadderEarn')) {
         const [bp, milestoneBp, moneyAwarded, winBonusPaid, grantId, id] = values;
         const row = state.earns.find((e) => e.id === id);
         if (row) Object.assign(row, { bp, milestoneBp, moneyAwarded, winBonusPaid, grantId });
@@ -722,7 +723,7 @@ describe("a failing reward cannot corrupt an outcome", () => {
       // than as a generic settle failure.
       expect(h.state.errors.map((e) => e.message)).toContain("pvp_ladder_migration_missing");
       expect(h.state.errors.find((e) => e.message === "pvp_ladder_migration_missing").meta.migration)
-        .toBe("20260730120000_add_pvp_ladder");
+        .toBe("0_mysql");
     } finally {
       h.prisma.$transaction = original;
     }

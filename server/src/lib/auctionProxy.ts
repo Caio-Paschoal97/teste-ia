@@ -34,7 +34,7 @@ export interface ProxyState {
 // covers the abnormal one: if the table is genuinely absent, proxy bidding
 // switches OFF and the auction house keeps working as plain highest-bid
 // bidding with the new increments still enforced — rather than every bid in
-// the game failing with an unhandled 42P01.
+// the game failing with a missing-table error.
 //
 // This is only possible because the maximum lives in its OWN table. Had it
 // been columns on Auction, the failure would be a missing column inside
@@ -48,8 +48,8 @@ export interface ProxyState {
 // promising it. Reproduced by execution in
 // tests/auctionProbeShillDegrade.test.ts.
 //
-// Two changes: the detector now insists on either Prisma's own P2021, the
-// SQLSTATE 42P01, or a message that actually NAMES this table; and the flag
+// Two changes: the detector now insists on either Prisma's own P2021 or
+// a missing-table message that actually NAMES this table; and the flag
 // is a deadline, so the next request after the cooldown re-probes and
 // recovers by itself.
 const DEGRADE_COOLDOWN_MS = 60_000;
@@ -60,10 +60,9 @@ function isMissingTable(e: unknown): boolean {
   const code = (e as { code?: string })?.code;
   if (code === "P2021") return true; // Prisma: table does not exist
   const msg = String((e as Error)?.message ?? "");
-  if (msg.includes("42P01")) return true; // Postgres: undefined_table
   // Anything else must name THIS table. A message about some other relation
   // is somebody else's outage and must not disable bidding here.
-  return /AuctionProxyBid/i.test(msg) && /does not exist/i.test(msg);
+  return /AuctionProxyBid/i.test(msg) && /does not exist|doesn't exist/i.test(msg);
 }
 
 function noteMissing(where: string): void {

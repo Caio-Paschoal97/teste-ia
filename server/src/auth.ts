@@ -33,7 +33,7 @@ const googleConfigured =
   !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET;
 
 export const auth = betterAuth({
-  database: prismaAdapter(prisma, { provider: "postgresql" }),
+  database: prismaAdapter(prisma, { provider: "mysql" }),
   secret: SECRET,
   baseURL: BACKEND_URL,
   trustedOrigins: FRONTEND_ORIGINS,

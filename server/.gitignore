@@ -4,3 +4,7 @@ dist/
 *.db
 *.db-journal
 prisma/dev.db*
+
+# Optional offline transfer tool
+.venv/
+__pycache__/

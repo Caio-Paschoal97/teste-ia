@@ -1,15 +1,11 @@
-// Pokemon MMO data model. Provider is set via DATABASE_URL — sqlite for
-// local dev (file:./dev.db), postgresql in prod (Railway).
-//
-// To switch providers in prod: change `provider = "postgresql"` here, run
-// `npx prisma migrate deploy`. Field types are kept compatible across both.
+// MySQL 8.4 in development and production. See MYSQL.md before a cutover.
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "mysql"
   url      = env("DATABASE_URL")
 }
 
@@ -67,18 +63,18 @@ model FunnelEvent {
 
 model User {
   id              String    @id
-  email           String    @unique
+  email           String    @unique @db.VarChar(320)
   emailVerified   Boolean   @default(false)
-  name            String?
+  name            String? @db.LongText
   username        String    @unique
-  displayUsername String?
-  image           String?
+  displayUsername String? @db.LongText
+  image           String? @db.LongText
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
   // Game state — stored as a JSON blob (serialized GameState minus
   // ephemeral fields). Updated periodically via /api/saves/upload.
-  saveData        String?   // JSON-encoded
+  saveData        String? @db.LongText   // JSON-encoded
   saveVersion     Int       @default(0)
   saveUpdatedAt   DateTime  @default(now())
   /// Monotonic counter the SERVER bumps whenever it authoritatively rewrites
@@ -132,7 +128,7 @@ model User {
   // bannedUntil > now blocks login + socket connections.
   isAdmin         Boolean   @default(false)
   bannedUntil     DateTime?
-  banReason       String?
+  banReason       String? @db.LongText
 
   // Relations
   sessions          Session[]
@@ -174,14 +170,14 @@ model StreamKey {
   userId     String    @unique
   key        String    @unique
   enabled    Boolean   @default(true)
-  label      String?
+  label      String? @db.LongText
   /// JSON stream automation config the admin sets for an unattended run:
   /// { startRoute?: string, autoBuyBalls?: { enabled, ballId, restockTo } }.
   /// Applied client-side when a stream session boots (see streamMode.ts).
-  config     String?
+  config     String? @db.LongText
   createdAt  DateTime  @default(now())
   lastUsedAt DateTime?
-  lastUsedIp String?
+  lastUsedIp String? @db.LongText
   user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([key])
@@ -205,7 +201,7 @@ model BroadcastState {
   updatedAt     DateTime  @updatedAt
   /// Reported by the renderer on each poll:
   live          Boolean   @default(false)
-  lastStatus    String?
+  lastStatus    String? @db.LongText
   lastStatusAt  DateTime?
   createdAt     DateTime  @default(now())
 }
@@ -221,7 +217,7 @@ model SaveSnapshot {
   id          String   @id @default(cuid())
   userId      String
   saveVersion Int
-  saveData    String
+  saveData    String @db.LongText
   /// Why it exists: "auto" (periodic) | "pre-restore" (captured just before
   /// an admin restore, so the restore is itself reversible).
   reason      String   @default("auto")
@@ -269,7 +265,7 @@ model PendingGrant {
   /// JSON array of Prize (see lib/giveaway.ts) — the exact same descriptors
   /// the giveaway/mass-gift UI produced. Stored verbatim so a grant can be
   /// re-read, audited, or hand-inspected long after the fact.
-  prizes    String
+  prizes    String @db.LongText
   /// Where it came from: "giveaway" | "mass-gift" | "backfill" | …
   /// Free-form on purpose; it is an audit label, never a control-flow key.
   source    String
@@ -278,7 +274,7 @@ model PendingGrant {
   sourceId  String?
   /// describePrizes() output, denormalised so ops can read the queue without
   /// parsing JSON, and so the client can toast a human summary.
-  summary   String
+  summary   String @db.LongText
   createdAt DateTime @default(now())
 
   /// NULL = still owed. Non-null = paid, once and for all.
@@ -307,7 +303,7 @@ model PendingGrant {
   /// would fail validateSave because the box is full). The grant stays owed;
   /// this is how ops find one that is stuck rather than merely unclaimed.
   attempts  Int     @default(0)
-  lastError String?
+  lastError String? @db.LongText
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -327,8 +323,8 @@ model Session {
   userId    String
   expiresAt DateTime
   token     String   @unique
-  ipAddress String?
-  userAgent String?
+  ipAddress String? @db.LongText
+  userAgent String? @db.LongText
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -339,16 +335,16 @@ model Session {
 
 model Account {
   id                    String    @id
-  accountId             String    // OAuth subject id, or email for credentials
+  accountId             String @db.VarChar(512)    // OAuth subject id, or email for credentials
   providerId            String    // "credential" | "google"
   userId                String
-  accessToken           String?
-  refreshToken          String?
-  idToken               String?
+  accessToken           String? @db.LongText
+  refreshToken          String? @db.LongText
+  idToken               String? @db.LongText
   accessTokenExpiresAt  DateTime?
   refreshTokenExpiresAt DateTime?
-  scope                 String?
-  password              String?   // hashed (credentials provider)
+  scope                 String? @db.LongText
+  password              String? @db.LongText   // hashed (credentials provider)
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
 
@@ -360,8 +356,8 @@ model Account {
 
 model Verification {
   id         String   @id
-  identifier String
-  value      String
+  identifier String @db.VarChar(512)
+  value      String @db.LongText
   expiresAt  DateTime
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
@@ -422,17 +418,17 @@ model MapCrop {
 model BugReport {
   id           String   @id @default(cuid())
   reporterId   String?  // nullable so a deleted user's reports survive for triage
-  reporterName String   // denormalized so admin doesn't need a join just to see who reported
-  title        String
-  description  String
-  page         String?  // window.location.href at submission
-  userAgent    String?
+  reporterName String @db.LongText   // denormalized so admin doesn't need a join just to see who reported
+  title        String @db.LongText
+  description  String @db.LongText
+  page         String? @db.LongText  // window.location.href at submission
+  userAgent    String? @db.LongText
   // JSON-encoded condensed game state snapshot (party species/levels,
   // currentLocation, last few battle-log lines). Optional — heavy
   // saves aren't worth shipping over the wire.
-  context      String?
+  context      String? @db.LongText
   status       String   @default("open") // "open" | "investigating" | "resolved" | "wontfix"
-  adminNotes   String?
+  adminNotes   String? @db.LongText
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -449,17 +445,17 @@ model ErrorLog {
   id         String   @id @default(cuid())
   kind       String   // "server" | "client"
   level      String   @default("error") // "error" | "warn"
-  message    String
-  stack      String?
+  message    String @db.LongText
+  stack      String? @db.LongText
   // Where it happened — server route path or client URL
-  source     String?
+  source     String? @db.LongText
   // Caller identity if known (server: from middleware; client: from cookie session)
   userId     String?
   username   String?
   // Useful auxiliary context
-  userAgent  String?
+  userAgent  String? @db.LongText
   // JSON-encoded extra data (request body excerpt, component stack, etc.)
-  meta       String?
+  meta       String? @db.LongText
   createdAt  DateTime @default(now())
 
   @@index([kind, createdAt])
@@ -474,9 +470,9 @@ model ErrorLog {
 model AdminAudit {
   id        String   @id @default(cuid())
   adminId   String   // who took the action
-  action    String   // e.g. "user.read_save", "user.ban", "user.delete"
+  action    String @db.LongText   // e.g. "user.read_save", "user.ban", "user.delete"
   targetId  String?  // affected user / message id when relevant
-  meta      String?  // optional JSON-encoded extras
+  meta      String? @db.LongText  // optional JSON-encoded extras
   createdAt DateTime @default(now())
 
   @@index([adminId, createdAt])
@@ -489,9 +485,9 @@ model AdminAudit {
 //   "dm:<userIdA>:<userIdB>" — DMs (sorted user ids so both sides resolve same key)
 model ChatMessage {
   id        String   @id @default(cuid())
-  channelId String
+  channelId String @db.VarChar(512)
   userId    String
-  content   String
+  content   String @db.LongText
   // "user" (default, ordinary chat) | "announcement" | "giveaway" |
   // "tradeOffer" — lets the client render system/giveaway broadcasts
   // and trade-offer cards distinctly instead of as a normal bubble
@@ -500,7 +496,7 @@ model ChatMessage {
   // rows.
   kind      String   @default("user")
   // JSON-encoded, kind-specific (e.g. tradeOffer: {offering, wanting}).
-  meta      String?
+  meta      String? @db.LongText
   createdAt DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -522,16 +518,16 @@ model PvpMatch {
   status      String   // "active" | "completed" | "forfeit" | "cancelled"
 
   userAId           String
-  userAUsername     String
-  userATeam         String   // JSON-serialized PokemonSet[] sent to @pkmn/sim
+  userAUsername     String @db.LongText
+  userATeam         String @db.LongText   // JSON-serialized PokemonSet[] sent to @pkmn/sim
   userBId           String
-  userBUsername     String
-  userBTeam         String
+  userBUsername     String @db.LongText
+  userBTeam         String @db.LongText
 
   winnerId          String?  // null on cancellation / mutual draw
   loserId           String?
   endReason         String?  // "ko" | "forfeit" | "timeout" | "cancelled"
-  battleLog         String?  // newline-joined Showdown protocol lines
+  battleLog         String? @db.LongText  // newline-joined Showdown protocol lines
   tournamentId      String?  // set when this match is part of a tournament round
 
   @@index([userAId, createdAt])
@@ -567,8 +563,8 @@ model Giveaway {
   endsAt      DateTime?
   drawnAt     DateTime?
 
-  title       String
-  description String
+  title       String @db.LongText
+  description String @db.LongText
   /// "draft" | "open" | "closed" | "drawn" | "cancelled"
   status      String   @default("draft")
 
@@ -581,13 +577,13 @@ model Giveaway {
   /// {"kind":"pokemon","speciesKey":"mew","level":50,"isShiny":true}]
   /// Kept as JSON rather than a table: prizes are small, never queried
   /// independently, and the shape evolves with the game's catalog.
-  prizes      String
+  prizes      String @db.LongText
 
   /// Optional entry gates. Null = anyone may enter.
   minAccountLevel Int?
   /// Recorded at draw time so the result can be re-derived and shown
   /// to be fair. Null until drawn.
-  drawSeed    String?
+  drawSeed    String? @db.LongText
 
   ownerId     String
 
@@ -634,9 +630,9 @@ model Poll {
   id        String     @id @default(cuid())
   createdAt DateTime   @default(now())
   closedAt  DateTime?
-  question  String
+  question  String @db.LongText
   /// JSON array of option label strings, e.g. ["Yes","No","Undecided"]
-  options   String
+  options   String @db.LongText
   /// "draft" | "open" | "closed"
   status    String     @default("draft")
   ownerId   String
@@ -679,12 +675,12 @@ model Announcement {
   type      String   @default("info")
 
   /// The banner text. Kept short — this is a single glanceable line.
-  message   String
+  message   String @db.LongText
 
   /// Optional call-to-action. `href` may be an external URL or an in-app
   /// hash route (e.g. "#giveaways"); `linkLabel` is the button text.
-  href      String?
-  linkLabel String?
+  href      String? @db.LongText
+  linkLabel String? @db.LongText
 
   /// Whether this banner is live. Only one row is active at a time;
   /// publishing a new banner flips every other row to false.
@@ -707,7 +703,7 @@ model Tournament {
   createdAt   DateTime @default(now())
   startsAt    DateTime?
   finishedAt  DateTime?
-  name        String
+  name        String @db.LongText
   format      String   // mirrors PvpMatch.format
   // Optional level cap applied to every PokemonSet at battle-start
   // time. Lets organisers run "Lv 50 only" or "Lv 100 cap" brackets
@@ -715,7 +711,7 @@ model Tournament {
   // is untouched — only the in-battle PokemonSet sees the cap.
   levelCap    Int?
   status      String   // "scheduled" | "open" | "live" | "completed" | "cancelled"
-  bracket     String?  // JSON tree of rounds → match slots
+  bracket     String? @db.LongText  // JSON tree of rounds → match slots
   ownerId     String   // admin who created it
 
   /// How long each ROUND stays open, in minutes. This is the single knob
@@ -738,14 +734,14 @@ model Tournament {
   /// `championUsername` is captured alongside so a later rename or a
   /// deleted account still renders a readable winner in history.
   championId       String?
-  championUsername String?
+  championUsername String? @db.LongText
 
   /// Optional JSON array of Prize (see lib/giveaway.ts) awarded to the
   /// champion when the final resolves. Delivered through the same durable
   /// PendingGrant inbox giveaways use, never by writing saveData.
   /// `prizeGrantedAt` is the idempotency marker — a second completion
   /// sweep must never pay twice.
-  prizes         String?
+  prizes         String? @db.LongText
   prizeGrantedAt DateTime?
 
   entries TournamentEntry[]
@@ -813,15 +809,15 @@ model TradeRecord {
   createdAt   DateTime @default(now())
 
   userAId           String
-  userAUsername     String
-  userASentMon      String   // JSON-serialized Pokémon snapshot
-  userASentSpecies  String
+  userAUsername     String @db.LongText
+  userASentMon      String @db.LongText   // JSON-serialized Pokémon snapshot
+  userASentSpecies  String @db.LongText
   userASentLevel    Int
 
   userBId           String
-  userBUsername     String
-  userBSentMon      String
-  userBSentSpecies  String
+  userBUsername     String @db.LongText
+  userBSentMon      String @db.LongText
+  userBSentSpecies  String @db.LongText
   userBSentLevel    Int
 
   @@index([userAId, createdAt])
@@ -847,7 +843,7 @@ model Auction {
   id              String    @id @default(cuid())
   sellerId        String
   pokemonId       String    // stable per-mon id from the seller's save at listing time
-  pokemonSnapshot String    // JSON Pokemon snapshot at listing time — display only, re-validated live at settlement
+  pokemonSnapshot String @db.LongText    // JSON Pokemon snapshot at listing time — display only, re-validated live at settlement
   startingBid     Int
   currentBid      Int       @default(0)
   currentBidderId String?
@@ -940,7 +936,7 @@ model AuctionProxyBid {
 // in the migration SQL and that this list is still present here, so the two
 // cannot silently diverge.
 //
-//   CHECK PvpLadderEarn_not_self          ("userId" <> "opponentUserId")
+//   TRIGGERS PvpLadderEarn_not_self          ("userId" <> "opponentUserId")
 //   CHECK PvpLadderEarn_nonneg            ("bp" >= 0 AND "milestoneBp" >= 0 AND "moneyAwarded" >= 0)
 //   CHECK PvpLadderEarn_money_needs_bonus ("moneyAwarded" = 0 OR "winBonusPaid")
 //   CHECK PvpWinBonusClaim_nonneg         ("money" >= 0)
@@ -1032,8 +1028,8 @@ model PvpLadderEarn {
   createdAt DateTime @default(now())
 
   earner   User @relation("PvpLadderEarner", fields: [userId], references: [id], onDelete: Cascade)
-  /// THE BOT GATE. A synthetic bot id violates this foreign key, Postgres
-  /// raises 23503, and the whole payout transaction — both sides' rows and both
+  /// THE BOT GATE. A synthetic bot id violates this foreign key, MySQL
+  /// raises 1452, and the whole payout transaction — both sides' rows and both
   /// grants — rolls back. A constraint rather than an if-statement, so no
   /// refactor can forget it.
   opponent User @relation("PvpLadderOpponent", fields: [opponentUserId], references: [id], onDelete: Cascade)
@@ -1045,11 +1041,9 @@ model PvpLadderEarn {
 }
 
 /// THE ATOMIC GATE for the once-per-cooldown cash bonus. ONE ROW PER ACCOUNT,
-/// holding the timestamp of its last claim; the settle claims with
-/// `ON CONFLICT ("userId") DO UPDATE … WHERE "claimedAt" <= now - cooldown`,
-/// which takes a row lock on the existing row and so serialises concurrent
-/// claims while staying exception-free (a lost race is 0 affected rows, not a
-/// 23505 that would poison the transaction and cost the whole match reward).
+/// holding the timestamp of its last claim. A conditional duplicate-key update
+/// locks the row and replaces its owner only after the cooldown. The transaction
+/// reads back the owning matchId, not a driver-specific affected-row count.
 ///
 /// It replaced a (userId, day) primary key, which was measured to be
 /// straddleable: a calendar key is satisfiable twice by two different day

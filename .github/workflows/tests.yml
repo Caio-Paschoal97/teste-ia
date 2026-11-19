@@ -37,7 +37,7 @@ jobs:
       # (see server/vitest.config.ts) and mock src/db.ts besides.
       - run: npx prisma generate
         env:
-          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+          DATABASE_URL: mysql://ci:ci@localhost:3306/ci
       - run: npm test
 
   game-tests:
