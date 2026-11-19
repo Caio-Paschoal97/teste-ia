@@ -16,7 +16,7 @@
 
 ## Ambiente
 
-Comandos de primeira instalação no [README](README.md#local-dev). O Compose sobe **só o banco**, com volume persistente e porta 3306 limitada ao loopback. `docker compose --env-file server/.env stop` preserva o volume. Não use `down -v`. As senhas de inicialização da imagem só são aplicadas na primeira criação do volume.
+Comandos de primeira instalação no [README](README.md#local-dev). O fluxo principal usa MySQL Server local com Workbench, sem Docker. O Compose opcional sobe **só o banco**, com volume persistente e porta 3306 limitada ao loopback. `docker compose --env-file server/.env stop` preserva o volume. Não use `down -v`. As senhas de inicialização da imagem só são aplicadas na primeira criação do volume.
 
 - `server/.env`: `DATABASE_URL=mysql://usuario:senha@host:3306/database` (percent-encode nos componentes da URL), `MYSQL_PASSWORD` no Compose local (senha literal correspondente). Na Railway, referenciar a URL **interna do serviço MySQL** na variável `DATABASE_URL` do backend; não usar o usuário/senha de exemplo. Configurar TLS de acordo com o provedor.
 - `BETTER_AUTH_SECRET` (32 bytes aleatórios; **preservar o segredo existente** na troca), `BETTER_AUTH_URL`, `FRONTEND_ORIGIN` (jogo e admin separados por vírgula), `PORT`, `ADMIN_BOOTSTRAP_EMAIL` e demais opcionais continuam em `server/.env.example`. Não publicar `.env`.

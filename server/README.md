@@ -4,17 +4,53 @@ Backend for the multiplayer Pokemon idle game. Hono + Prisma + Better Auth + Soc
 
 ## Local dev
 
-```bash
-# From the repository root (do not overwrite an existing .env)
-cp -n server/.env.example server/.env
-# Edit server/.env: local MySQL credentials + a random BETTER_AUTH_SECRET
-docker compose --env-file server/.env up -d --wait mysql
-cd server
-npm ci
-npm run db:generate
-npm run db:deploy
-npm run dev                # starts on http://localhost:8787
-```
+### Sem Docker: MySQL Workbench + MySQL Server local
+
+O Workbench é o cliente gráfico. O processo que guarda os dados é o **MySQL Server 8.4**. Se já existir uma conexão local funcionando no Workbench, não instale outro servidor.
+
+1. No Workbench, abra uma conexão **Standard TCP/IP** para `127.0.0.1`, porta `3306` (ou a porta configurada). Execute:
+
+   ```sql
+   SELECT VERSION(), @@hostname, @@port, @@global.time_zone,
+          @@log_bin, @@log_bin_trust_function_creators;
+   ```
+
+   Se a conexão for recusada, verifique se o serviço MySQL está iniciado (no Windows, abra **Serviços**) e confira a porta. Se instalou **só** o Workbench, instale também o **MySQL Community Server 8.4 LTS** e inicie o serviço. O Workbench pode ser fechado depois da configuração; o serviço precisa continuar ligado.
+
+2. Para um **ambiente de teste novo**, em uma conexão administrativa local, execute **uma instrução por vez**. Se o banco ou a conta já existirem, pare e confira antes de reutilizá-los. Não apague nada.
+
+   ```sql
+   CREATE DATABASE pokeidle CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin;
+   CREATE USER 'pokeidle'@'127.0.0.1' IDENTIFIED BY RANDOM PASSWORD;
+   GRANT ALL PRIVILEGES ON `pokeidle`.* TO 'pokeidle'@'127.0.0.1';
+   ```
+
+   Guarde a senha devolvida por `CREATE USER`. A permissão é só para esse banco; não use `root` no backend. A migration cria triggers. **Antes do primeiro deploy**, se `@@log_bin = 1` e `@@log_bin_trust_function_creators = 0`, em um **servidor dedicado apenas a testes** o administrador pode configurar `log_bin_trust_function_creators=1` na seção `[mysqld]` do `my.ini`/`my.cnf` e reiniciar o serviço. Configure também `default-time-zone='+00:00'` se o servidor não estiver em UTC. Em servidor compartilhado, não altere configurações globais: combine o deploy com o DBA.
+
+3. Com Node.js 20+ e npm instalados, **copie** `server/.env.example` para `server/.env` (pode usar o explorador de arquivos; não sobrescreva um `.env` existente). Edite:
+
+   ```dotenv
+   DATABASE_URL="mysql://pokeidle:SENHA_CODIFICADA@127.0.0.1:3306/pokeidle"
+   ```
+
+   Use a porta verificada no passo 1. Na URL, codifique caracteres especiais da senha (por exemplo, `@` vira `%40`); use a senha original no Workbench. `MYSQL_PASSWORD` é lida apenas pelo Compose e não é necessária aqui. Para esse ambiente novo, gere `BETTER_AUTH_SECRET` com `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"` e coloque o resultado no `.env`. Não compartilhe o arquivo.
+
+4. Na raiz do repositório, execute no terminal (não no editor SQL):
+
+   ```sh
+   cd server
+   npm ci
+   npm run db:generate
+   npm run db:deploy
+   npm run db:status
+   npm run dev
+   ```
+
+   Não há seed. O status deve indicar que o banco está atualizado. Confira `http://localhost:8787/healthz`. Em **outro terminal na raiz**, execute `cd game`, `npm ci` e `npm run dev`; abra `http://localhost:5173`. Nas próximas vezes, basta manter o serviço MySQL ligado e iniciar o backend e o jogo. Se houver novas migrations, aplique-as antes de iniciar o backend.
+
+### Alternativa com Docker (opcional)
+
+O Compose substitui apenas o MySQL Server local. Não inicie os dois na mesma porta. Para essa alternativa, prepare `server/.env` conforme `.env.example` (incluindo `MYSQL_PASSWORD`) e, na raiz, execute `docker compose --env-file server/.env up -d --wait mysql`. Continue no passo 4 acima.
 
 ## Production (Railway)
 

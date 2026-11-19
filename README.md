@@ -18,12 +18,10 @@ Three independent npm packages — no top-level workspace. Each has its own `pac
 
 ## Local dev
 
+Docker is optional. First [prepare a native MySQL 8.4 database using Workbench and configure `server/.env`](server/README.md#local-dev). Then:
+
 ```bash
 # 1. Server
-# From the repository root (do not overwrite an existing .env)
-cp -n server/.env.example server/.env
-# Edit server/.env: local MySQL credentials + a random BETTER_AUTH_SECRET
-docker compose --env-file server/.env up -d --wait mysql
 cd server
 npm ci
 npm run db:generate
