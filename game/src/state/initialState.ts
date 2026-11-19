@@ -1,0 +1,92 @@
+import type { GameState } from "../types";
+import { DEFAULT_CATCH_SETTINGS } from "../data/raidLegendaries";
+import { regions, DEFAULT_REGION } from "../data/regions";
+
+// First-time game state lives in the default region (Kanto today). Any
+// "starting Pokémon" / "starting location" defaults are read from the
+// region definition so adding a new region doesn't require touching
+// this file — only the registry.
+const startingRegion = regions[DEFAULT_REGION];
+
+export const initialState: GameState = {
+  phase: "starterSelect",
+  playerPokemon: null,
+  enemyPokemon: null,
+  currentRoute: "route1",
+  battleEvents: [],
+  pendingEvents: [],
+  currentEventIndex: 0,
+  speed: 1,
+  paused: false,
+  battleLog: [],
+  battleLogSeq: 0,
+  levelUpNotification: null,
+  wildBattlesWon: 0,
+  trainerBattlesWon: 0,
+  battlesWonByLocation: {},
+  party: [],
+  box: [],
+  autoCatch: true,
+  nextPokemonId: 1,
+  currentLocation: startingRegion.startingLocation,
+  unlockedLocations: [startingRegion.startingLocation, "route1"],
+  evolutionState: null,
+  catchSettings: {},
+  globalCatchDefaults: DEFAULT_CATCH_SETTINGS,
+  money: 3000,
+  inventory: { pokeball: 20 },
+  trainerBattle: null,
+  bossBattle: null,
+  bossQueue: [],
+  activePlayerPokemonIndex: 0,
+  healingState: null,
+  pendingBossBattle: null,
+  alwaysCatchShinies: true,
+  pokedexSeen: [],
+  pokedexCaught: [],
+  shinyCaught: [],
+  shinySeen: [],
+  defeatedGyms: [],
+  defeatedEliteFour: [],
+  championDefeated: false,
+  defeatedChampions: [],
+  claimedRegionStarters: [],
+  victoryTokens: 0,
+  autoProceed: false,
+  // ON by default, and — because absent keys fall through this object on both
+  // load paths — ON for every save written before the field existed too. This
+  // is an idle game: a level evolution costs nothing and can't be declined
+  // into a worse outcome, so a mandatory click was pure friction. Players who
+  // want a specific mon left alone use its per-Pokémon lock (Pokemon.noEvolve).
+  autoEvolve: true,
+  // OFF by default. Releasing is the only irreversible action in the game, so
+  // the prompt has to be opted OUT of, never opted into by accident. Even on, a
+  // shiny still asks and the bulk confirmation is never skippable.
+  skipReleaseConfirm: false,
+  listedPokemonIds: [],
+  // OFF by default. Healing is free, so this is not about cost — it changes the
+  // PACE of play (you stop ever seeing a worn-down party), and a setting that
+  // silently rewrites how every existing save plays is worse than one the player
+  // turns on. The trigger is idle-only and never fires in a raid; see
+  // useBattleLoop.
+  autoHeal: false,
+  autoHealThreshold: 35,
+  raidCooldownEnd: null,
+  raidCooldowns: {},
+  raidLegendary: null,
+  inRaid: false,
+  raidLevel: 0,
+  preRaidLocation: null,
+  playerVolatile: null,
+  activeEffects: [],
+  awaitingSwitch: false,
+  defeatedTrainers: [],
+  battleMode: "auto",
+  catchAnim: null,
+  whiteoutAnim: null,
+};
+
+// STARTER_KEYS is sourced from the default region. Kept as a named
+// export so the StarterSelect UI and Pokédex lookups don't need to
+// understand the region system yet.
+export const STARTER_KEYS = startingRegion.starters;
