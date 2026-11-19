@@ -1,6 +1,0 @@
-node_modules
-dist
-.env
-# Music files are dropped in by the operator; keep the folder, ignore the audio.
-music/*
-!music/.gitkeep
