@@ -1,0 +1,1628 @@
+import { randomInt, randomUUID } from "node:crypto";
+import {
+  ATK_MS,
+  BALL,
+  CATCH_BALL_ITEMS,
+  DELTA,
+  DIR,
+  PARTY_CAP,
+  PLAYER_HP,
+  POTIONS,
+  PLAYABLE_KANTO_SLUGS,
+  SPECIES,
+  STARTERS,
+  STEP_MS,
+  WILD_COMBAT_STEP_MS,
+  WILD_STEP_MS,
+  applyRubyHealth,
+  behind,
+} from "./species.js";
+import {
+  MAP,
+  SPAWN,
+  WILD_GROUPS,
+  currentSpawn,
+  hasRoof,
+  inBounds,
+  isNoPvpZone,
+  isProtectionZone,
+  isPvpZone,
+  meadowWildSpots,
+  pokeZoneAtSpawnTile,
+  tilesForPz,
+  tileName,
+  walkable,
+  wildMayStep,
+} from "./map.js";
+import { isInPokeZone } from "../shared/pokeZone.js";
+import { loadSave, saveNow } from "./persist.js";
+import { playerProgressFields } from "./otpProgress.js";
+import { isSafeZone, isCombatSafeZone } from "../shared/safeZone.js";
+import { habitatExport } from "../shared/editor/mapRuntime.ts";
+import { ITEM_BOX_SLOTS } from "../shared/itemBoxCaps.js";
+import { isChatStaff, normalizeChatRole } from "../shared/chatRole.js";
+import {
+  isKantoSlug,
+  officialSpeciesName,
+  parseSpeciesDexId,
+  pokemonPlateText,
+  speciesDexId,
+  SHINY_RATE,
+} from "../shared/kantoDex.js";
+import { ensureBarMoves, barMoveAt } from "../shared/attackBar.js";
+
+const CATCH_CAP = ITEM_BOX_SLOTS.catch;
+const BAG_SLOT_CAP = ITEM_BOX_SLOTS.bag;
+const CAPTURE_ANIM_MS = 3200;
+
+const CORPSE_LOOT = [
+  { item: "premierball", min: 0, max: 1, weight: 2 },
+  { item: "ultraball", min: 0, max: 1, weight: 1 },
+  { item: "small_potion", min: 0, max: 2, weight: 3 },
+  { item: "great_potion", min: 0, max: 1, weight: 1 },
+];
+
+function normalizeLootBag(bag) {
+  if (!Array.isArray(bag)) return [];
+  return bag.filter((i) => i && i.item && Number(i.count) > 0);
+}
+
+function lootBagUsedSlots(bag) {
+  return bag.filter((i) => i && Number(i.count) > 0).length;
+}
+
+function addStack(bag, item, count, maxSlots = BAG_SLOT_CAP) {
+  if (!count) return true;
+  let row = bag.find((i) => i.item === item);
+  if (!row) {
+    if (lootBagUsedSlots(bag) >= maxSlots) return false;
+    row = { item, count: 0 };
+    bag.push(row);
+  }
+  row.count += count;
+  return true;
+}
+
+function takeStack(bag, item, count = 1) {
+  const row = bag.find((i) => i.item === item);
+  if (!row || row.count < count) return false;
+  row.count -= count;
+  if (row.count <= 0) {
+    const idx = bag.indexOf(row);
+    bag.splice(idx, 1);
+  }
+  return true;
+}
+
+function migrateLootBag(rec) {
+  if (!rec.lootBag?.length && rec.bag?.length) rec.lootBag = rec.bag.map((i) => ({ ...i }));
+  if (!rec.lootBag) rec.lootBag = [];
+  if (!rec.catchBox) rec.catchBox = [];
+  const hasCatch = rec.lootBag.some((i) => i?.count > 0 && CATCH_BALL_ITEMS.includes(i.item));
+  if (!hasCatch) {
+    addStack(rec.lootBag, "premierball", 10);
+    addStack(rec.lootBag, "ultraball", 10);
+    addStack(rec.lootBag, "masterball", 5);
+    addStack(rec.lootBag, "pokeball", 15);
+  }
+  return rec;
+}
+
+let nextId = 1;
+function cid() {
+  return nextId++;
+}
+
+export class World {
+  constructor() {
+    this.save = loadSave();
+    this.clients = new Map();
+    this.creatures = new Map();
+    this.occupancy = new Map();
+    this.wildRespawnAt = 0;
+    this.ensureDemoAccount();
+    this.ensureWild();
+    this.ensureNpcs();
+    this.dirty = false;
+    this.chatSeq = 1;
+    this.chatByMid = new Map();
+  }
+
+  key(x, y) {
+    return `${x},${y}`;
+  }
+
+  occupy(creature) {
+    this.occupancy.set(this.key(creature.x, creature.y), creature.id);
+  }
+
+  vacate(creature) {
+    const k = this.key(creature.x, creature.y);
+    if (this.occupancy.get(k) !== creature.id) return;
+    this.occupancy.delete(k);
+    for (const c of this.creatures.values()) {
+      if (c.id === creature.id || c.dead) continue;
+      if (c.x === creature.x && c.y === creature.y) {
+        this.occupancy.set(k, c.id);
+        break;
+      }
+    }
+  }
+
+  occupant(x, y) {
+    const id = this.occupancy.get(this.key(x, y));
+    return id ? this.creatures.get(id) : null;
+  }
+
+  /** OTClient-style: só NPCs bloqueiam passo; players/wilds/pokémon fora passam uns pelos outros. */
+  isSolidCreature(c) {
+    return !!c && !c.dead && c.kind === "npc";
+  }
+
+  blockingOccupant(x, y) {
+    for (const c of this.creatures.values()) {
+      if (c.x === x && c.y === y && this.isSolidCreature(c)) return c;
+    }
+    return null;
+  }
+
+  persist() {
+    this.dirty = true;
+  }
+
+  flush() {
+    if (!this.dirty) return;
+    saveNow(this.save);
+    this.dirty = false;
+  }
+
+  send(ws, msg) {
+    if (ws.readyState === 1) ws.send(JSON.stringify(msg));
+  }
+
+  broadcast(msg, except = null) {
+    const data = JSON.stringify(msg);
+    for (const [ws] of this.clients) {
+      if (ws !== except && ws.readyState === 1) ws.send(data);
+    }
+  }
+
+  broadcastArea(msg) {
+    this.broadcast(msg);
+  }
+
+  attach(ws) {
+    const client = { ws, account: null, playerId: null, charName: null };
+    this.clients.set(ws, client);
+    this.send(ws, { t: "hello", motd: "OTPokemon Web milestone. demo/demo" });
+  }
+
+  detach(ws) {
+    const client = this.clients.get(ws);
+    if (!client) return;
+    if (client.playerId) this.logoutPlayer(client, false);
+    this.clients.delete(ws);
+  }
+
+  handle(ws, msg) {
+    const client = this.clients.get(ws);
+    if (!client || !msg || typeof msg !== "object") return;
+    const t = msg.t;
+    try {
+      if (t === "register") return this.register(client, msg);
+      if (t === "login") return this.login(client, msg);
+      if (t === "create") return this.createCharacter(client, msg);
+      if (t === "enter") return this.enter(client, msg);
+      if (!client.playerId) return this.err(client, "Not in game.");
+      const player = this.creatures.get(client.playerId);
+      if (!player) return this.err(client, "Player missing.");
+      if (t === "walk") return this.walk(player, msg.dir, true);
+      if (t === "walkTo") return this.setWalkTo(player, msg.x, msg.y);
+      if (t === "turn") return this.turn(player, msg.dir);
+      if (t === "look") return this.look(player, msg.x, msg.y);
+      if (t === "use") return this.use(player, msg);
+      if (t === "say") return this.say(player, msg.text);
+      if (t === "chatDel") return this.chatDel(player, msg);
+      if (t === "logout") return this.logoutPlayer(client, true);
+      if (t === "pokebar") return this.pokebar(player, msg.slot);
+      if (t === "partyOrder") return this.partyOrder(player, msg);
+      if (t === "catchSwap") return this.catchSwap(player, msg);
+      if (t === "hud") return this.saveHud(player, msg);
+      if (t === "catch") return this.catchBall(player);
+      if (t === "target") return this.setTarget(player, msg.id);
+      if (t === "attack") return this.attack(player, msg.id);
+      if (t === "move") return this.useMove(player, Number(msg.n));
+      if (t === "order") return this.order(player, msg);
+    } catch (err) {
+      console.error(err);
+      this.err(client, "Server error.");
+    }
+  }
+
+  err(client, text) {
+    this.send(client.ws, { t: "err", text });
+  }
+
+  sys(player, text) {
+    const client = this.clientOf(player);
+    if (client) this.send(client.ws, { t: "info", text });
+  }
+
+  clientOf(player) {
+    for (const [, c] of this.clients) if (c.playerId === player.id) return c;
+    return null;
+  }
+
+  register(client, { user, pass }) {
+    const name = String(user || "").trim().toLowerCase();
+    const password = String(pass || "");
+    if (!/^[a-z0-9_]{3,16}$/.test(name)) return this.err(client, "Invalid account name.");
+    if (password.length < 3) return this.err(client, "Password too short.");
+    if (this.save.accounts[name]) return this.err(client, "Account exists.");
+    this.save.accounts[name] = { password, chars: [] };
+    this.persist();
+    client.account = name;
+    this.send(client.ws, { t: "welcome", user: name, chars: [] });
+  }
+
+  login(client, { user, pass }) {
+    const name = String(user || "").trim().toLowerCase();
+    const acc = this.save.accounts[name];
+    if (!acc || acc.password !== String(pass || "")) return this.err(client, "Wrong account or password.");
+    client.account = name;
+    this.send(client.ws, { t: "welcome", user: name, chars: acc.chars.slice() });
+  }
+
+  createCharacter(client, { name, starter }) {
+    if (!client.account) return this.err(client, "Login first.");
+    const charName = String(name || "").trim();
+    if (!/^[A-Za-z][A-Za-z0-9 ]{1,18}$/.test(charName)) return this.err(client, "Invalid character name.");
+    const key = charName.toLowerCase();
+    if (Object.keys(this.save.characters).some((n) => n.toLowerCase() === key)) {
+      return this.err(client, "Name already taken.");
+    }
+    const specKey = String(starter || "").toLowerCase();
+    if (!STARTERS.includes(specKey) || !PLAYABLE_KANTO_SLUGS.includes(specKey)) {
+      return this.err(client, "Choose Bulbasaur, Charmander or Squirtle.");
+    }
+    const spec = SPECIES[specKey];
+    const record = {
+      name: charName,
+      account: client.account,
+      x: SPAWN.x,
+      y: SPAWN.y,
+      z: MAP.z,
+      dir: DIR.S,
+      hp: PLAYER_HP,
+      hpMax: PLAYER_HP,
+      lootBag: [
+        { item: "premierball", count: 5 },
+        { item: "ultraball", count: 5 },
+        { item: "masterball", count: 2 },
+        { item: "pokeball", count: 20 },
+      ],
+      party: [this.makeMon(specKey, 5)],
+      catchBox: [],
+      out: null,
+      target: null,
+      mount: null,
+    };
+    record.x = SPAWN.x;
+    record.y = SPAWN.y;
+    this.save.characters[charName] = record;
+    this.save.accounts[client.account].chars.push(charName);
+    this.persist();
+    this.send(client.ws, {
+      t: "welcome",
+      user: client.account,
+      chars: this.save.accounts[client.account].chars.slice(),
+    });
+  }
+
+  makeMon(species, level = 5, opts = {}) {
+    const key = String(species || "").toLowerCase();
+    if (!isKantoSlug(key) || !SPECIES[key]) {
+      throw new Error(`Only Kanto #1–151 playable species are allowed (${species})`);
+    }
+    const spec = SPECIES[key];
+    const mon = {
+      uid: opts.uid || randomUUID(),
+      species: key,
+      name: spec.name,
+      look: spec.look,
+      shiny: !!opts.shiny,
+      gender: opts.gender || (randomInt(0, 2) ? "m" : "f"),
+      level,
+      baseHp: spec.baseStats.hp,
+      baseStats: { ...spec.baseStats },
+      ball: opts.ball || "charged",
+      dexId: speciesDexId(key, !!opts.shiny),
+    };
+    applyRubyHealth(mon);
+    if (opts.hp != null) mon.hp = Math.max(0, Math.min(opts.hp, mon.hpMax));
+    ensureBarMoves(mon);
+    return mon;
+  }
+
+  ensureMon(mon) {
+    if (!mon) return mon;
+    const spec = SPECIES[mon.species];
+    if (!spec) return mon;
+    mon.look = spec.look;
+    mon.name = officialSpeciesName(mon.species, false) || spec.name;
+    mon.shiny = !!mon.shiny;
+    mon.dexId = speciesDexId(mon.species, mon.shiny);
+    mon.baseStats = { ...spec.baseStats };
+    mon.baseHp = spec.baseStats.hp;
+    delete mon.ivs;
+    delete mon.evs;
+    applyRubyHealth(mon);
+    ensureBarMoves(mon);
+    return mon;
+  }
+
+  ensureDemoAccount() {
+    if (!this.save.accounts.demo) this.save.accounts.demo = { password: "demo", chars: [] };
+    const acc = this.save.accounts.demo;
+    acc.password = "demo";
+    let name = acc.chars.find((n) => this.save.characters[n]?.account === "demo") || acc.chars[0] || "Demo";
+    if (!acc.chars.includes(name)) acc.chars.unshift(name);
+    let rec = this.save.characters[name];
+    if (!rec || rec.account !== "demo") {
+      rec = {
+        name,
+        account: "demo",
+        x: SPAWN.x,
+        y: SPAWN.y,
+        z: MAP.z,
+        dir: DIR.S,
+        hp: PLAYER_HP,
+        hpMax: PLAYER_HP,
+        lootBag: [],
+        catchBox: [],
+        party: [],
+        out: 0,
+        target: null,
+      };
+    }
+    migrateLootBag(rec);
+    rec.lootBag = [
+      { item: "small_potion", count: 87 },
+      { item: "great_potion", count: 8 },
+      { item: "premierball", count: 42 },
+      { item: "ultraball", count: 42 },
+      { item: "masterball", count: 42 },
+    ];
+    rec.catchBox = rec.catchBox || [];
+    const party = (rec.party || []).filter(Boolean).map((p) => this.ensureMon(p));
+    if (!party.some((p) => p.species === "charizard")) party.unshift(this.makeMon("charizard", 36));
+    if (!party.some((p) => p.species === "rapidash")) {
+      const at = party[0]?.species === "charizard" ? 1 : 0;
+      party.splice(at, 0, this.makeMon("rapidash", 40));
+    }
+    rec.party = party.slice(0, PARTY_CAP);
+    rec.out = rec.party.findIndex((p) => p?.species === "charizard");
+    if (rec.out < 0) rec.out = 0;
+    rec.mount = null;
+    if (!walkable(rec.x, rec.y)) {
+      rec.x = SPAWN.x;
+      rec.y = SPAWN.y;
+    }
+    this.save.characters[name] = rec;
+    this.persist();
+  }
+
+  enter(client, { name }) {
+    if (!client.account) return this.err(client, "Login first.");
+    const charName = String(name || "");
+    const rec = this.save.characters[charName];
+    if (!rec || rec.account !== client.account) return this.err(client, "Unknown character.");
+    migrateLootBag(rec);
+    if (this.findPlayerByName(charName)) this.forceLogoutName(charName);
+    const progress = playerProgressFields(rec);
+    const player = {
+      id: cid(),
+      kind: "player",
+      name: rec.name,
+      x: rec.x,
+      y: rec.y,
+      z: rec.z,
+      dir: rec.dir ?? DIR.S,
+      hp: rec.hp,
+      hpMax: rec.hpMax,
+      gold: rec.gold ?? 925.79,
+      fishPct: rec.fishPct ?? 31,
+      ...progress,
+      look: 128,
+      busyUntil: 0,
+      targetId: null,
+      walkTo: null,
+      mount: null,
+      charName,
+      chatRole: normalizeChatRole(rec.chatRole),
+      lootBag: normalizeLootBag(rec.lootBag),
+      catchBox: (rec.catchBox || []).map((p) => this.ensureMon(p)),
+      party: (rec.party || []).map((p) => this.ensureMon(p)),
+      outSlot: rec.out,
+      outId: null,
+    };
+    if (!walkable(player.x, player.y)) {
+      const spawn = currentSpawn();
+      player.x = spawn.x;
+      player.y = spawn.y;
+    }
+    this.creatures.set(player.id, player);
+    this.occupy(player);
+    client.playerId = player.id;
+    client.charName = charName;
+    player.hud = rec.hud || null;
+    this.snapshotPlayer(player);
+    if (Number.isInteger(player.outSlot) && player.party[player.outSlot]) {
+      this.releaseSlot(player, player.outSlot, true);
+    }
+    this.send(client.ws, {
+      t: "map",
+      map: {
+        w: MAP.w,
+        h: MAP.h,
+        z: MAP.z,
+        ground: MAP.ground,
+        walls: MAP.walls,
+        roofs: MAP.roofs,
+        items: MAP.items,
+        cells: MAP.cells,
+        flags: MAP.flags,
+        houses: MAP.houses,
+        pokeZoneIds: MAP.pokeZoneIds,
+        pzIds: MAP.pzIds,
+        ...habitatExport(MAP),
+        spawn: currentSpawn(),
+      },
+      you: this.publicCreature(player),
+      creatures: [...this.creatures.values()].map((c) => this.publicCreature(c)),
+      party: this.partyPayload(player),
+      lootBag: player.lootBag,
+      bag: player.lootBag,
+      catchBox: this.catchBoxPayload(player),
+      gold: player.gold,
+      hud: player.hud || rec.hud || null,
+      chatRole: normalizeChatRole(player.chatRole),
+    });
+    this.broadcastArea({ t: "appear", creature: this.publicCreature(player) }, client.ws);
+    if (player.outId) {
+      const poke = this.creatures.get(player.outId);
+      if (poke) this.broadcastArea({ t: "appear", creature: this.publicCreature(poke) }, client.ws);
+    }
+  }
+
+  findPlayerByName(name) {
+    for (const c of this.creatures.values()) {
+      if (c.kind === "player" && c.charName === name) return c;
+    }
+    return null;
+  }
+
+  forceLogoutName(name) {
+    for (const [ws, client] of this.clients) {
+      if (client.charName === name) this.logoutPlayer(client, false);
+    }
+  }
+
+  snapshotPlayer(player) {
+    const rec = this.save.characters[player.charName];
+    if (!rec) return;
+    rec.x = player.x;
+    rec.y = player.y;
+    rec.z = player.z;
+    rec.dir = player.dir;
+    rec.hp = player.hp;
+    rec.hpMax = player.hpMax;
+    rec.lootBag = player.lootBag;
+    rec.bag = player.lootBag;
+    rec.catchBox = player.catchBox;
+    rec.gold = player.gold;
+    rec.party = player.party;
+    rec.out = player.outSlot;
+    rec.hud = player.hud || rec.hud;
+    this.persist();
+  }
+
+  logoutPlayer(client, notify) {
+    const player = this.creatures.get(client.playerId);
+    if (player) {
+      if (player.outId) {
+        const poke = this.creatures.get(player.outId);
+        if (poke) {
+          const mon = player.party.find((p) => p && p.uid === poke.uid);
+          if (mon) {
+            mon.hp = poke.hp;
+            mon.ball = "discharged";
+          }
+          this.vacate(poke);
+          this.creatures.delete(poke.id);
+          this.broadcastArea({ t: "disappear", id: poke.id });
+        }
+        player.outId = null;
+      }
+      this.snapshotPlayer(player);
+      this.vacate(player);
+      this.creatures.delete(player.id);
+      this.broadcastArea({ t: "disappear", id: player.id });
+    }
+    client.playerId = null;
+    client.charName = null;
+    if (notify) this.send(client.ws, { t: "loggedOut" });
+    this.flush();
+  }
+
+  pokemonLabel(c) {
+    const base = officialSpeciesName(c.species, false) || c.name || "Pokémon";
+    return c.shiny ? `Shiny ${base}` : base;
+  }
+
+  publicCreature(c) {
+    const label = c.kind === "player" || c.kind === "npc" ? c.name : this.pokemonLabel(c);
+    const base = {
+      id: c.id,
+      kind: c.kind,
+      name: label,
+      x: c.x,
+      y: c.y,
+      z: c.z,
+      dir: c.dir,
+      look: c.look,
+      species: c.species || null,
+      shiny: !!c.shiny,
+      dexId: c.kind === "player" || c.kind === "npc" ? null : speciesDexId(c.species, c.shiny),
+      hp: c.hp,
+      hpMax: c.hpMax,
+      level: c.level || (c.kind === "player" ? 1 : 5),
+      masterId: c.masterId || null,
+      wild: !!c.wild,
+      canTarget: c.kind !== "npc" && c.canTarget !== false,
+      plate:
+        c.kind === "npc"
+          ? `${c.name} (!)`
+          : c.kind === "player"
+            ? c.name
+            : pokemonPlateText(c),
+      dead: !!c.dead,
+      mount: c.mount
+        ? { ability: c.mount.ability, species: c.mount.species, look: c.mount.look }
+        : null,
+    };
+    if (c.kind === "player") {
+      base.gold = c.gold ?? 925.79;
+      base.fishPct = c.fishPct ?? 31;
+      Object.assign(base, playerProgressFields(c));
+    }
+    return base;
+  }
+
+  partyPayload(player) {
+    const slots = [];
+    for (let i = 0; i < PARTY_CAP; i++) {
+      const p = player.party[i];
+      slots.push(
+        p
+          ? {
+              slot: i,
+              uid: p.uid,
+              species: p.species,
+              name: this.pokemonLabel(p),
+              look: p.look,
+              hp: p.hp,
+              hpMax: p.hpMax,
+              level: p.level,
+              shiny: !!p.shiny,
+              dexId: speciesDexId(p.species, p.shiny),
+              gender: p.gender || (String(p.uid || "a").charCodeAt(0) % 2 ? "m" : "f"),
+              ball: i === player.outSlot ? "discharged" : p.ball || "charged",
+              barMoves: (p.barMoves || []).map((m) => ({
+                name: m.name,
+                power: m.power,
+                type: m.type,
+                tile: m.tile,
+              })),
+            }
+          : null
+      );
+    }
+    return {
+      slots,
+      out: player.outSlot,
+      count: player.party.filter(Boolean).length,
+      mount: player.mount
+        ? {
+            ability: player.mount.ability,
+            species: player.mount.species,
+            look: player.mount.look,
+            slot: player.mount.slot,
+          }
+        : null,
+    };
+  }
+
+  catchBoxPayload(player) {
+    return (player.catchBox || []).map((p) =>
+      p
+        ? {
+            uid: p.uid,
+            species: p.species,
+            name: p.name,
+            look: p.look,
+            hp: p.hp,
+            hpMax: p.hpMax,
+            level: p.level,
+            gender: p.gender || (String(p.uid || "a").charCodeAt(0) % 2 ? "m" : "f"),
+          }
+        : null
+    );
+  }
+
+  syncParty(player) {
+    const client = this.clientOf(player);
+    if (!client) return;
+    this.send(client.ws, {
+      t: "party",
+      party: this.partyPayload(player),
+      lootBag: player.lootBag,
+      bag: player.lootBag,
+      catchBox: this.catchBoxPayload(player),
+      gold: player.gold,
+    });
+  }
+
+  playerInSafeZone(player) {
+    return isCombatSafeZone(player.x, player.y, {
+      spawn: currentSpawn(),
+      flags: MAP.flags,
+    });
+  }
+
+  grantCorpseLoot(player, creature) {
+    if (!player?.lootBag || !creature?.wild) return;
+    const totalWeight = CORPSE_LOOT.reduce((s, row) => s + row.weight, 0);
+    let roll = randomInt(1, totalWeight + 1);
+    for (const row of CORPSE_LOOT) {
+      roll -= row.weight;
+      if (roll <= 0) {
+        const count = randomInt(row.min, row.max + 1);
+        if (count > 0 && !addStack(player.lootBag, row.item, count)) {
+          this.sys(player, "Sua Bag está cheia (30 slots).");
+          return;
+        }
+        break;
+      }
+    }
+    const coinDrop = randomInt(0, 4);
+    if (coinDrop) player.gold = Number(player.gold || 0) + coinDrop;
+    this.sys(player, `Loot do corpo de ${creature.name}.`);
+  }
+
+  catchSwap(player, msg) {
+    if (!this.playerInSafeZone(player)) {
+      return this.sys(player, "Troca com o time só em zona segura.");
+    }
+    const catchIndex = Number(msg.catchIndex);
+    const partySlot = Number(msg.partySlot);
+    if (!Number.isInteger(catchIndex) || catchIndex < 0 || catchIndex >= (player.catchBox?.length || 0)) {
+      return;
+    }
+    if (!Number.isInteger(partySlot) || partySlot < 0 || partySlot >= PARTY_CAP) return;
+    if (partySlot === player.outSlot && player.outId) {
+      return this.sys(player, "Guarde o Pokémon antes de trocar.");
+    }
+    while (player.party.length < PARTY_CAP) player.party.push(null);
+    const fromCatch = player.catchBox[catchIndex];
+    const fromParty = player.party[partySlot];
+    player.party[partySlot] = fromCatch;
+    if (fromParty) player.catchBox[catchIndex] = fromParty;
+    else player.catchBox.splice(catchIndex, 1);
+    this.syncParty(player);
+    this.snapshotPlayer(player);
+    this.sys(player, "Pokémon movido entre Catch e o time.");
+  }
+
+  now() {
+    return Date.now();
+  }
+
+  walk(creature, dir, fromClient, stepMs = STEP_MS) {
+    dir = Number(dir);
+    if (!Number.isInteger(dir) || dir < 0 || dir > 7) return;
+    if (fromClient && creature.kind === "player") creature.walkTo = null;
+    if (creature.dead) return;
+    const t = this.now();
+    if (t < creature.busyUntil) return;
+    creature.dir = dir;
+    const d = DELTA[dir];
+    const nx = creature.x + d.x;
+    const ny = creature.y + d.y;
+    if (
+      !this.canWildEnterTile(creature, nx, ny) ||
+      !walkable(nx, ny, { surf: creature.mount?.ability === "surf" }) ||
+      this.blockingOccupant(nx, ny)
+    ) {
+      this.broadcastArea({ t: "turn", id: creature.id, dir });
+      if (creature.kind === "player") this.snapshotPlayer(creature);
+      return;
+    }
+    this.vacate(creature);
+    creature.x = nx;
+    creature.y = ny;
+    creature.busyUntil = t + stepMs;
+    this.occupy(creature);
+    this.broadcastArea({
+      t: "moved",
+      id: creature.id,
+      x: creature.x,
+      y: creature.y,
+      dir,
+      ms: stepMs,
+    });
+    if (creature.kind === "player") this.snapshotPlayer(creature);
+  }
+
+  canWildEnterTile(creature, x, y) {
+    if (!creature?.wild) return true;
+    if (creature.pzId) return wildMayStep(creature, x, y);
+    const pz = creature.pokeZone;
+    if (!pz) return true;
+    return isInPokeZone(x, y, pz.anchorX, pz.anchorY, pz.radius);
+  }
+
+  wildIsTargeted(wild) {
+    for (const c of this.creatures.values()) {
+      if (c.kind === "player" && c.targetId === wild.id) return true;
+    }
+    return false;
+  }
+
+  pickWildWanderDir(wild) {
+    const opts = [];
+    for (let dir = 0; dir < 8; dir++) {
+      const nx = wild.x + DELTA[dir].x;
+      const ny = wild.y + DELTA[dir].y;
+      if (!walkable(nx, ny) || this.blockingOccupant(nx, ny)) continue;
+      if (!this.canWildEnterTile(wild, nx, ny)) continue;
+      opts.push(dir);
+    }
+    if (!opts.length) return null;
+    return opts[randomInt(0, opts.length)];
+  }
+
+  wildCombatShuffle(wild, attacker) {
+    if (!wild?.wild || wild.dead || !attacker) return;
+    const t = this.now();
+    if (t < wild.busyUntil) return;
+    const ax = attacker.x;
+    const ay = attacker.y;
+    const away = [];
+    const any = [];
+    for (let dir = 0; dir < 8; dir++) {
+      const nx = wild.x + DELTA[dir].x;
+      const ny = wild.y + DELTA[dir].y;
+      if (!walkable(nx, ny) || this.blockingOccupant(nx, ny)) continue;
+      if (!this.canWildEnterTile(wild, nx, ny)) continue;
+      const distNow = Math.max(Math.abs(ax - wild.x), Math.abs(ay - wild.y));
+      const distNew = Math.max(Math.abs(ax - nx), Math.abs(ay - ny));
+      any.push({ dir, distNew, diag: dir % 2 });
+      if (distNew >= distNow) away.push({ dir, distNew, diag: dir % 2 });
+    }
+    const pool = away.length ? away : any;
+    if (!pool.length) return;
+    pool.sort((a, b) => b.distNew - a.distNew || a.diag - b.diag);
+    this.walk(wild, pool[0].dir, false, WILD_COMBAT_STEP_MS);
+  }
+
+  turn(creature, dir) {
+    dir = Number(dir);
+    if (!Number.isInteger(dir) || dir < 0 || dir > 7) return;
+    creature.dir = dir;
+    this.broadcastArea({ t: "turn", id: creature.id, dir });
+    if (creature.kind === "player") this.snapshotPlayer(creature);
+  }
+
+  isForbiddenTarget(player, c) {
+    if (!c) return true;
+    if (c.dead) return true;
+    if (c.kind === "npc" || c.canTarget === false) return true;
+    if (c.id === player.id) return true;
+    if (c.masterId != null && c.masterId === player.id) return true;
+    if (player.outId != null && c.id === player.outId) return true;
+    return false;
+  }
+
+  zoneCombatMessage(player, target) {
+    if (target?.wild) {
+      if (isProtectionZone(player.x, player.y) && isProtectionZone(target.x, target.y)) {
+        return "Esta é uma área segura.";
+      }
+      return null;
+    }
+    if (
+      this.playerInSafeZone(player) ||
+      isProtectionZone(target.x, target.y) ||
+      isSafeZone(target.x, target.y, currentSpawn())
+    ) {
+      return "Esta é uma área segura.";
+    }
+    if (target.kind === "player" && (isNoPvpZone(player.x, player.y) || isNoPvpZone(target.x, target.y))) {
+      return "PVP não é permitido aqui.";
+    }
+    return null;
+  }
+
+  tileLookExtra(x, y) {
+    const bits = [];
+    const houseId = MAP.houses?.[y]?.[x];
+    if (houseId) bits.push(`house ${houseId}`);
+    if (isProtectionZone(x, y)) bits.push("SAFE");
+    else if (isNoPvpZone(x, y)) bits.push("non-PVP");
+    else if (isPvpZone(x, y)) bits.push("PVP");
+    return bits.length ? ` ${bits.join(" · ")}.` : "";
+  }
+
+  sendTarget(player, c) {
+    const client = this.clientOf(player);
+    if (!client) return;
+    if (!c) this.send(client.ws, { t: "target", id: null });
+    else
+      this.send(client.ws, {
+        t: "target",
+        id: c.id,
+        plate: c.plate || pokemonPlateText(c),
+        name: c.name,
+        dexId: speciesDexId(c.species, c.shiny),
+      });
+  }
+
+  look(player, x, y) {
+    x = Number(x);
+    y = Number(y);
+    const who = this.occupant(x, y) || this.corpseAt(x, y);
+    let text;
+    if (who) {
+      if (who.kind === "player" || who.kind === "npc") text = `You see ${who.name}.`;
+      else if (who.dead) text = `Você vê o corpo de um ${who.name}.`;
+      else text = `You see ${who.name} [${who.level || 5}]. Health: ${who.hp} / ${who.hpMax}.`;
+    }     else text = `You see ${tileName(x, y)}.`;
+    this.sys(player, text + this.tileLookExtra(x, y));
+  }
+
+  use(player, msg) {
+    const item = String(msg?.item || "");
+    if (item === "pokeball" || CATCH_BALL_ITEMS.includes(item)) {
+      const tid = msg.id != null ? Number(msg.id) : null;
+      return this.catchBall(player, item, tid);
+    }
+    if (item === "small_potion" || item === "great_potion") {
+      return this.usePotion(player, item, msg.id != null ? Number(msg.id) : null);
+    }
+    this.sys(player, "Nada acontece.");
+  }
+
+  usePotion(player, item, targetId) {
+    const potion = POTIONS[item];
+    if (!player.lootBag.find((i) => i.item === item && i.count > 0)) {
+      return this.sys(player, "Você não tem essa poção.");
+    }
+    let poke = null;
+    if (player.outId) poke = this.creatures.get(player.outId);
+    if (targetId && this.creatures.get(targetId)?.masterId === player.id) {
+      poke = this.creatures.get(targetId);
+    }
+    if (!poke || poke.dead) return this.sys(player, "Solte um Pokémon para curar.");
+    if (poke.hp >= poke.hpMax) return this.sys(player, `${poke.name} já está com HP cheio.`);
+    takeStack(player.lootBag, item, 1);
+    poke.hp = Math.min(poke.hpMax, poke.hp + potion.heal);
+    this.sys(player, `${poke.name} recuperou HP.`);
+    this.syncParty(player);
+    this.snapshotPlayer(player);
+  }
+
+  say(player, text) {
+    text = String(text || "").slice(0, 120);
+    if (!text) return;
+    const m = /^m(\d{1,2})$/i.exec(text.trim());
+    if (m) return this.useMove(player, Number(m[1]));
+    const mid = this.chatSeq++;
+    this.chatByMid.set(mid, { playerId: player.id, ts: this.now() });
+    if (this.chatByMid.size > 500) {
+      const oldest = [...this.chatByMid.keys()].slice(0, 100);
+      for (const k of oldest) this.chatByMid.delete(k);
+    }
+    this.broadcastArea({ t: "say", id: player.id, name: player.name, text, mid });
+  }
+
+  chatDel(player, msg) {
+    const mid = Number(msg.mid);
+    if (!Number.isFinite(mid)) return;
+    const entry = this.chatByMid.get(mid);
+    if (!entry) return;
+    const staff = isChatStaff(player.chatRole);
+    if (entry.playerId !== player.id && !staff) {
+      const client = this.clientOf(player);
+      if (client) this.err(client, "Sem permissão para apagar esta mensagem.");
+      return;
+    }
+    this.chatByMid.delete(mid);
+    this.broadcastArea({ t: "sayDel", mid });
+  }
+
+  setTarget(player, id) {
+    if (id == null || id === "" || id === false) {
+      player.targetId = null;
+      this.sendTarget(player, null);
+      return;
+    }
+    id = Number(id);
+    if (!Number.isFinite(id)) {
+      player.targetId = null;
+      this.sendTarget(player, null);
+      return;
+    }
+    const c = this.creatures.get(id);
+    if (!c || this.isForbiddenTarget(player, c)) {
+      player.targetId = null;
+      this.sendTarget(player, null);
+      return;
+    }
+    player.targetId = id;
+    this.sendTarget(player, c);
+  }
+
+  attack(player, id) {
+    id = Number(id);
+    const c = this.creatures.get(id);
+    if (!c || this.isForbiddenTarget(player, c)) {
+      this.sys(player, "Você não tem um alvo.");
+      return;
+    }
+    player.targetId = id;
+    this.sendTarget(player, c);
+    if (!this.outPokemon(player)) {
+      return this.sys(player, "Você precisa ter um Pokémon fora.");
+    }
+    const blocked = this.zoneCombatMessage(player, c);
+    if (blocked) {
+      this.sys(player, blocked);
+      return;
+    }
+    if (!c.wild) return this.sys(player, "Você não tem um alvo.");
+    if (c.dead) return this.sys(player, "Esse Pokémon já foi derrotado.");
+    this.useMove(player, 1);
+  }
+
+  setWalkTo(player, x, y) {
+    x = Number(x);
+    y = Number(y);
+    if (!inBounds(x, y)) return;
+    player.walkTo = { x, y };
+  }
+
+  tickClickWalk() {
+    for (const c of this.creatures.values()) {
+      if (c.kind !== "player" || !c.walkTo) continue;
+      if (this.now() < c.busyUntil) continue;
+      const { x, y } = c.walkTo;
+      if (c.x === x && c.y === y) {
+        c.walkTo = null;
+        continue;
+      }
+      const destBlock = this.blockingOccupant(x, y);
+      const dist = Math.max(Math.abs(x - c.x), Math.abs(y - c.y));
+      if (destBlock && dist <= 1) {
+        c.walkTo = null;
+        continue;
+      }
+      const dir = this.greedyDir(c.x, c.y, x, y, c.id);
+      if (dir == null) {
+        c.walkTo = null;
+        continue;
+      }
+      this.walk(c, dir, false);
+    }
+  }
+
+  pokebar(player, slot) {
+    slot = Number(slot);
+    if (!Number.isInteger(slot) || slot < 0 || slot >= PARTY_CAP) return;
+    if (player.mount) {
+      const mounted = player.mount.slot;
+      this.dismount(player);
+      if (slot === mounted) return;
+    }
+    const mon = player.party[slot];
+    if (!mon) return;
+    if (player.outSlot === slot) {
+      this.goback(player, true);
+      return;
+    }
+    if (player.outSlot != null) this.goback(player, true);
+    this.releaseSlot(player, slot, false);
+  }
+
+  saveHud(player, msg) {
+    if (!msg?.layout || typeof msg.layout !== "object") return;
+    player.hud = msg.layout;
+    this.snapshotPlayer(player);
+  }
+
+  partyOrder(player, { from, to }) {
+    from = Number(from);
+    to = Number(to);
+    if (!Number.isInteger(from) || !Number.isInteger(to)) return;
+    if (from < 0 || to < 0 || from >= PARTY_CAP || to >= PARTY_CAP || from === to) return;
+    const party = player.party.slice();
+    while (party.length < PARTY_CAP) party.push(null);
+    const [mon] = party.splice(from, 1);
+    party.splice(to, 0, mon);
+    player.party = party.slice(0, PARTY_CAP);
+    if (player.outSlot === from) player.outSlot = to;
+    else if (player.outSlot != null) {
+      if (from < player.outSlot && to >= player.outSlot) player.outSlot -= 1;
+      else if (from > player.outSlot && to <= player.outSlot) player.outSlot += 1;
+    }
+    if (player.mount?.slot === from) player.mount.slot = to;
+    else if (player.mount?.slot != null) {
+      if (from < player.mount.slot && to >= player.mount.slot) player.mount.slot -= 1;
+      else if (from > player.mount.slot && to <= player.mount.slot) player.mount.slot += 1;
+    }
+    this.syncParty(player);
+    this.snapshotPlayer(player);
+  }
+
+  releaseSlot(player, slot, restoring) {
+    const mon = player.party[slot];
+    if (!mon) return;
+    if (player.outId) this.goback(player, false);
+    const pos = this.summonTile(player);
+    if (!pos) {
+      this.sys(player, "No space to release.");
+      return;
+    }
+    const poke = {
+      id: cid(),
+      kind: "pokemon",
+      name: mon.name,
+      species: mon.species,
+      shiny: !!mon.shiny,
+      dexId: speciesDexId(mon.species, mon.shiny),
+      look: mon.look,
+      x: pos.x,
+      y: pos.y,
+      z: player.z,
+      dir: player.dir,
+      hp: mon.hp,
+      hpMax: mon.hpMax,
+      level: mon.level,
+      baseHp: mon.baseHp,
+      baseStats: mon.baseStats,
+      ivs: mon.ivs,
+      evs: mon.evs,
+      masterId: player.id,
+      busyUntil: 0,
+      uid: mon.uid,
+    };
+    this.creatures.set(poke.id, poke);
+    this.occupy(poke);
+    player.outSlot = slot;
+    player.outId = poke.id;
+    mon.ball = "discharged";
+    if (!restoring) this.broadcastArea({ t: "appear", creature: this.publicCreature(poke) });
+    this.syncParty(player);
+    this.snapshotPlayer(player);
+    if (!restoring) this.sys(player, `Go, ${mon.name}!`);
+  }
+
+  goback(player, talk) {
+    const poke = player.outId ? this.creatures.get(player.outId) : null;
+    if (poke) {
+      const mon = player.party.find((p) => p && p.uid === poke.uid);
+      if (mon) {
+        mon.hp = poke.hp;
+        mon.ball = "charged";
+      }
+      this.vacate(poke);
+      this.creatures.delete(poke.id);
+      this.broadcastArea({ t: "disappear", id: poke.id });
+    }
+    if (talk && player.party[player.outSlot]) this.sys(player, `${player.party[player.outSlot].name}, come back!`);
+    player.outId = null;
+    player.outSlot = null;
+    this.syncParty(player);
+    this.snapshotPlayer(player);
+  }
+
+  order(player, msg) {
+    const ability = String(msg.ability || "").toLowerCase();
+    if (!["fly", "hide", "ride", "surf"].includes(ability)) return;
+    if (player.mount?.ability === ability) {
+      this.dismount(player);
+      return;
+    }
+    const slot = this.findAbilitySlot(player, ability);
+    if (slot == null) {
+      this.sys(player, "Nenhum Pokémon com essa habilidade.");
+      return;
+    }
+    this.mount(player, slot, ability);
+  }
+
+  findAbilitySlot(player, ability) {
+    if (player.mount && SPECIES[player.mount.species]?.abilities?.includes(ability)) {
+      return player.mount.slot;
+    }
+    if (player.outSlot != null) {
+      const mon = player.party[player.outSlot];
+      if (mon && SPECIES[mon.species]?.abilities?.includes(ability)) return player.outSlot;
+    }
+    return null;
+  }
+
+  mount(player, slot, ability) {
+    const mon = player.party[slot];
+    const spec = mon ? SPECIES[mon.species] : null;
+    if (!mon || !spec?.abilities?.includes(ability)) {
+      this.sys(player, "Nenhum Pokémon com essa habilidade.");
+      return;
+    }
+    if (player.outId) this.goback(player, false);
+    if (player.mount) {
+      player.mount = null;
+      player.look = 128;
+    }
+    player.mount = {
+      ability,
+      species: mon.species,
+      look: spec.look,
+      uid: mon.uid,
+      slot,
+    };
+    player.look = spec.look;
+    this.broadcastArea({ t: "outfit", creature: this.publicCreature(player) });
+    this.syncParty(player);
+    this.snapshotPlayer(player);
+    const label = ability === "fly" ? "Fly" : ability === "ride" ? "Ride" : ability === "hide" ? "Hide" : "Surf";
+    this.sys(player, `${label}!`);
+  }
+
+  dismount(player) {
+    const mount = player.mount;
+    player.mount = null;
+    player.look = 128;
+    this.broadcastArea({ t: "outfit", creature: this.publicCreature(player) });
+    this.syncParty(player);
+    this.snapshotPlayer(player);
+    if (mount && Number.isInteger(mount.slot) && player.party[mount.slot]) {
+      this.releaseSlot(player, mount.slot, false);
+    }
+  }
+
+  summonTile(player) {
+    const trySpot = (x, y) => walkable(x, y) && !this.blockingOccupant(x, y) && !isProtectionZone(x, y);
+    const b = behind(player.x, player.y, player.dir);
+    if (trySpot(b.x, b.y)) return b;
+    for (let r = 1; r <= 3; r++) {
+      for (const d of DELTA) {
+        const x = player.x + d.x * r;
+        const y = player.y + d.y * r;
+        if (trySpot(x, y)) return { x, y };
+      }
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+          const x = player.x + dx;
+          const y = player.y + dy;
+          if (trySpot(x, y)) return { x, y };
+        }
+      }
+    }
+    return null;
+  }
+
+  outPokemon(player) {
+    return player.outId ? this.creatures.get(player.outId) : null;
+  }
+
+  useMove(player, n) {
+    if (n < 1 || n > 8) return;
+    const poke = this.outPokemon(player);
+    if (!poke) {
+      this.sys(player, "Você precisa ter um Pokémon fora.");
+      return;
+    }
+    const move = barMoveAt(poke, n);
+    if (!move) return;
+    const target = player.targetId ? this.creatures.get(player.targetId) : null;
+    if (!target || this.isForbiddenTarget(player, target) || target.id === poke.id) {
+      this.sys(player, "Você não tem um alvo.");
+      return;
+    }
+    const blocked = this.zoneCombatMessage(player, target);
+    if (blocked) {
+      this.sys(player, blocked);
+      return;
+    }
+    if (target.dead) {
+      this.sys(player, "Esse Pokémon já foi derrotado.");
+      return;
+    }
+    const t = this.now();
+    if (t < (player.atkBusyUntil || 0) || t < (poke.atkBusyUntil || 0)) return;
+    player.atkBusyUntil = t + ATK_MS;
+    poke.atkBusyUntil = t + ATK_MS;
+    const dmg = Math.max(2, Math.floor(move.power / 5) + randomInt(1, 3));
+    target.hp = Math.max(0, (target.hp || 1) - dmg);
+    this.broadcastArea({
+      t: "fx",
+      from: poke.id,
+      to: target.id,
+      move: move.name,
+      dmg,
+      hp: target.hp,
+      hpMax: target.hpMax,
+    });
+    this.sys(player, `Seu ${poke.name} causou ${dmg} de dano em um ${target.name}.`);
+    if (target.kind === "pokemon" && target.masterId) {
+      const master = this.creatures.get(target.masterId);
+      const mon = master?.party.find((p) => p && p.uid === target.uid);
+      if (mon) mon.hp = target.hp;
+      if (master) this.syncParty(master);
+    }
+    if (target.hp <= 0) {
+      this.defeat(target);
+      return;
+    }
+    if (target.wild) {
+      this.wildCombatShuffle(target, poke);
+      this.wildRetaliate(target, poke);
+    }
+  }
+
+  wildRetaliate(wild, poke) {
+    if (!wild?.wild || wild.dead || !poke || poke.hp <= 0) return;
+    const dmg = Math.max(1, randomInt(1, 3));
+    poke.hp = Math.max(0, poke.hp - dmg);
+    this.broadcastArea({
+      t: "fx",
+      from: wild.id,
+      to: poke.id,
+      move: "Tackle",
+      dmg,
+      hp: poke.hp,
+      hpMax: poke.hpMax,
+      retaliate: true,
+    });
+    const master = this.creatures.get(poke.masterId);
+    if (!master) return;
+    this.sys(master, `Um ${wild.name} causou ${dmg} de dano em seu ${poke.name}.`);
+    const mon = master.party.find((p) => p && p.uid === poke.uid);
+    if (mon) mon.hp = poke.hp;
+    this.syncParty(master);
+    if (poke.hp <= 0) {
+      this.sys(master, `${poke.name} foi nocauteado!`);
+      this.goback(master, false);
+    }
+  }
+
+  flee(creature) {
+    if (!creature.wild) return;
+    if (this.wildIsTargeted(creature)) return;
+    this.vacate(creature);
+    this.creatures.delete(creature.id);
+    this.broadcastArea({ t: "disappear", id: creature.id });
+    this.wildRespawnAt = this.now() + 8000;
+    for (const c of this.creatures.values()) {
+      if (c.kind === "player" && c.targetId === creature.id) c.targetId = null;
+    }
+  }
+
+  defeat(creature) {
+    if (!creature.wild) return;
+    creature.dead = true;
+    creature.hp = 0;
+    creature.busyUntil = this.now() + 1e12;
+    this.vacate(creature);
+    this.broadcastArea({ t: "down", id: creature.id, x: creature.x, y: creature.y });
+    for (const c of this.creatures.values()) {
+      if (c.kind === "player" && c.targetId === creature.id) {
+        this.grantCorpseLoot(c, creature);
+        c.targetId = null;
+        this.sendTarget(c, null);
+      }
+    }
+  }
+
+  removeCorpse(creature) {
+    if (!creature) return;
+    this.vacate(creature);
+    this.creatures.delete(creature.id);
+    this.broadcastArea({ t: "disappear", id: creature.id });
+    for (const c of this.creatures.values()) {
+      if (c.kind === "player" && c.targetId === creature.id) c.targetId = null;
+    }
+    this.ensureWild();
+  }
+
+  catchBall(player, ballItem = "pokeball", targetId = null) {
+    const ball = BALL[ballItem] || BALL.pokeball;
+    if (!takeStack(player.lootBag, ball.item, 1)) {
+      const label =
+        ball.item === "premierball"
+          ? "Premier Balls"
+          : ball.item === "ultraball"
+            ? "Ultra Balls"
+            : ball.item === "masterball"
+              ? "Master Balls"
+              : "Pokébolas";
+      return this.sys(player, `Você não tem ${label}.`);
+    }
+    let target = null;
+    if (targetId != null) target = this.creatures.get(Number(targetId));
+    if (!target && player.targetId) {
+      const fallback = this.creatures.get(player.targetId);
+      if (fallback?.wild && fallback.dead) target = fallback;
+    }
+    if (!target || !target.wild) {
+      addStack(player.lootBag, ball.item, 1);
+      return this.sys(player, "Você não tem um alvo.");
+    }
+    if (!target.dead) {
+      addStack(player.lootBag, ball.item, 1);
+      return this.sys(player, "O Pokémon ainda está vivo.");
+    }
+    const spec = SPECIES[target.species];
+    const rate = spec.catchRate * ball.rate;
+    const roll = randomInt(1, 101);
+    const ok = ball.guaranteed === true || roll <= rate;
+    this.broadcastArea({
+      t: "catchAttempt",
+      from: player.id,
+      to: target.id,
+      ball: ball.item,
+      ok,
+      x: target.x,
+      y: target.y,
+    });
+    if (ok) {
+      const mon = this.makeMon(target.species, target.level || 2, { shiny: !!target.shiny });
+      while (player.party.length < PARTY_CAP) player.party.push(null);
+      let placed = false;
+      for (let i = 0; i < PARTY_CAP; i++) {
+        if (!player.party[i]) {
+          player.party[i] = mon;
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        if ((player.catchBox?.length || 0) >= CATCH_CAP) {
+          addStack(player.lootBag, ball.item, 1);
+          return this.sys(player, "Catch e party cheios.");
+        }
+        if (!player.catchBox) player.catchBox = [];
+        player.catchBox.push(mon);
+        this.sys(player, "Catch successful — enviado para a reserva.");
+      } else {
+        this.sys(player, "Catch successful");
+      }
+      const corpseId = target.id;
+      setTimeout(() => {
+        const c = this.creatures.get(corpseId);
+        if (c?.dead) this.removeCorpse(c);
+      }, CAPTURE_ANIM_MS);
+      player.targetId = null;
+    } else {
+      this.sys(player, `${target.name} escapou!`);
+      player.targetId = null;
+    }
+    this.syncParty(player);
+    this.snapshotPlayer(player);
+  }
+
+  followStep(poke) {
+    const master = this.creatures.get(poke.masterId);
+    if (!master) return;
+    let follow = master;
+    if (master.targetId) {
+      const t = this.creatures.get(master.targetId);
+      if (t && t.id !== poke.id && !t.dead) follow = t;
+    }
+    const dest = behind(follow.x, follow.y, follow.dir);
+    if (poke.x === dest.x && poke.y === dest.y) {
+      poke.dir = follow.dir;
+      return;
+    }
+    const dir = this.greedyDir(poke.x, poke.y, dest.x, dest.y, poke.id);
+    if (dir == null) return;
+    this.walk(poke, dir, false);
+  }
+
+  greedyDir(x, y, tx, ty, selfId) {
+    const opts = [];
+    for (let dir = 0; dir < 8; dir++) {
+      const nx = x + DELTA[dir].x;
+      const ny = y + DELTA[dir].y;
+      if (!walkable(nx, ny, { surf: false })) continue;
+      if (this.blockingOccupant(nx, ny)) continue;
+      const dist = Math.max(Math.abs(tx - nx), Math.abs(ty - ny));
+      const cur = Math.max(Math.abs(tx - x), Math.abs(ty - y));
+      if (dist <= cur) opts.push({ dir, dist, diag: dir % 2 });
+    }
+    opts.sort((a, b) => a.dist - b.dist || a.diag - b.diag);
+    return opts.length ? opts[0].dir : null;
+  }
+
+  spawnNpc(def) {
+    if ([...this.creatures.values()].some((c) => c.kind === "npc" && c.name === def.name)) return;
+    let { x, y } = def;
+    if (!walkable(x, y) || this.blockingOccupant(x, y)) {
+      const nearby = [];
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const nx = def.x + dx;
+          const ny = def.y + dy;
+          if (walkable(nx, ny) && !this.blockingOccupant(nx, ny)) nearby.push({ x: nx, y: ny });
+        }
+      }
+      if (!nearby.length) return;
+      x = nearby[0].x;
+      y = nearby[0].y;
+    }
+    const npc = {
+      id: cid(),
+      kind: "npc",
+      name: def.name,
+      x,
+      y,
+      z: MAP.z,
+      dir: DIR.S,
+      look: def.look ?? 128,
+      hp: 150,
+      hpMax: 150,
+      level: def.level ?? 1,
+      canTarget: false,
+      wild: false,
+      busyUntil: 0,
+    };
+    this.creatures.set(npc.id, npc);
+    this.occupy(npc);
+  }
+
+  ensureNpcs() {
+    for (const def of [
+      { name: "Enfermeira Joy", x: 10, y: 10 },
+      { name: "Oficial Jenny", x: 20, y: 10 },
+      { name: "Professor Carvalho", x: 8, y: 4 },
+      { name: "Dono", x: 14, y: 13, look: SPECIES.charizard.look, level: 36 },
+      { name: "Salamence Toy", x: 11, y: 12, look: SPECIES.charizard.look },
+      { name: "Shuckle Game", x: 17, y: 12, look: SPECIES.squirtle.look },
+    ]) {
+      this.spawnNpc(def);
+    }
+  }
+
+  corpseAt(x, y) {
+    for (const c of this.creatures.values()) {
+      if (c.dead && c.x === x && c.y === y) return c;
+    }
+    return null;
+  }
+
+  wildSpots(group) {
+    if (group.spots === "wild") return MAP.wildSpawns;
+    if (group.spots === "meadow") return meadowWildSpots();
+    return group.spots || MAP.wildSpawns;
+  }
+
+  ensureWild() {
+    for (const group of WILD_GROUPS) {
+      const living = [...this.creatures.values()].filter(
+        (c) => c.wild && !c.dead && c.species === group.species
+      ).length;
+      for (let i = living; i < group.want; i++) this.spawnWild(group.species, this.wildSpots(group));
+    }
+    this.ensureMapDexSpawns();
+  }
+
+  ensureMapDexSpawns() {
+    for (const spot of MAP.wildSpawns || []) {
+      const parsed = parseSpeciesDexId(spot.dexId);
+      if (!parsed || !SPECIES[parsed.slug]) continue;
+      const dest = this.resolveWildSpawnTile(spot);
+      const taken = [...this.creatures.values()].some(
+        (c) => c.wild && !c.dead && c.x === dest.x && c.y === dest.y
+      );
+      if (taken) continue;
+      this.spawnWildAt(parsed.slug, dest.x, dest.y, parsed.shiny, spot.pzId);
+    }
+  }
+
+  resolveWildSpawnTile(spot) {
+    if (!spot?.pzId) return spot;
+    const tiles = tilesForPz(spot.pzId);
+    if (!tiles.length) return spot;
+    if (tiles.some((t) => t.x === spot.x && t.y === spot.y)) return spot;
+    const free = tiles.filter(
+      (s) => walkable(s.x, s.y) && !this.occupant(s.x, s.y) && !isProtectionZone(s.x, s.y) && !(MAP.houses?.[s.y]?.[s.x])
+    );
+    return free[0] || tiles[0];
+  }
+
+  spawnWild(species = "caterpie", spots = MAP.wildSpawns) {
+    const key = String(species || "").toLowerCase();
+    if (!isKantoSlug(key) || !SPECIES[key]) return;
+    const list = spots || MAP.wildSpawns;
+    const free = list.filter(
+      (s) => walkable(s.x, s.y) && !this.occupant(s.x, s.y) && !isProtectionZone(s.x, s.y) && !(MAP.houses?.[s.y]?.[s.x])
+    );
+    if (!free.length) return;
+    const spot = free[randomInt(0, free.length)];
+    this.spawnWildAt(key, spot.x, spot.y, null, spot.pzId);
+  }
+
+  spawnWildAt(species, x, y, shinyForced, pzId) {
+    const key = String(species || "").toLowerCase();
+    if (!isKantoSlug(key) || !SPECIES[key]) return;
+    if (!walkable(x, y) || this.blockingOccupant(x, y) || isProtectionZone(x, y) || MAP.houses?.[y]?.[x]) return;
+    const spec = SPECIES[key];
+    const shiny = shinyForced == null ? randomInt(1, SHINY_RATE + 1) === 1 : !!shinyForced;
+    const sample = this.makeMon(key, 2, { shiny });
+    const linkedPz = Number(pzId) > 0 ? Number(pzId) : 0;
+    const pokeZone = pokeZoneAtSpawnTile(x, y);
+    const wild = {
+      id: cid(),
+      kind: "wild",
+      wild: true,
+      species: key,
+      name: sample.name,
+      shiny,
+      dexId: sample.dexId,
+      look: spec.look,
+      x,
+      y,
+      z: MAP.z,
+      dir: DIR.S,
+      hp: sample.hp,
+      hpMax: sample.hpMax,
+      level: 2,
+      baseHp: spec.baseStats.hp,
+      baseStats: { ...spec.baseStats },
+      busyUntil: 0,
+      pokeZone,
+      ...(linkedPz ? { pzId: linkedPz } : {}),
+    };
+    this.creatures.set(wild.id, wild);
+    this.occupy(wild);
+    this.broadcastArea({ t: "appear", creature: this.publicCreature(wild) });
+  }
+
+  tickWildWander() {
+    const t = this.now();
+    for (const c of this.creatures.values()) {
+      if (!c.wild || c.dead || t < c.busyUntil) continue;
+      if (this.wildIsTargeted(c)) continue;
+      if (randomInt(0, 5) !== 0) continue;
+      const dir = this.pickWildWanderDir(c);
+      if (dir == null) continue;
+      this.walk(c, dir, false, WILD_STEP_MS);
+    }
+  }
+
+  tick() {
+    const t = this.now();
+    this.tickClickWalk();
+    for (const c of this.creatures.values()) {
+      if (c.kind === "pokemon" && c.masterId && t >= c.busyUntil) this.followStep(c);
+    }
+    this.tickWildWander();
+    if (this.wildRespawnAt && t >= this.wildRespawnAt) {
+      this.wildRespawnAt = 0;
+      this.ensureWild();
+    }
+    this.flush();
+  }
+}
